@@ -1,0 +1,42 @@
+{
+  "name": "@herdr/a2a-pi",
+  "version": "0.1.5",
+  "description": "Managed zero-config workspace A2A for Pi agents in Herdr.",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions/herdr-a2a.ts",
+    "skills/herdr-a2a/SKILL.md",
+    "src/inbox-pump.ts",
+    "src/session-client.ts",
+    "src/team-command.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/herdr-a2a.ts"
+    ],
+    "skills": [
+      "./skills/herdr-a2a"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.2",
+    "typebox": ">=1.3.7 <1.4.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "24.12.4",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

@@ -1,0 +1,147 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-signed-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - name: Verify trusted signed version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09' \
+            'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID8mhKoSvoSEzgN45bawiPh6UWKe+I5PRWkrhrswRwTL' \
+            > "$RUNNER_TEMP/herdr-a2a-allowed-signers"
+          bash scripts/verify-release-tag.sh \
+            --tag "$GITHUB_REF_NAME" \
+            --expected-sha "$GITHUB_SHA" \
+            --allowed-signers "$RUNNER_TEMP/herdr-a2a-allowed-signers"
+          version=$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' plugins/herdr/herdr-plugin.toml)
+          test "$GITHUB_REF_NAME" = "v$version"
+
+  build:
+    needs: verify-signed-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          cache-dependency-path: integrations/pi/package-lock.json
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.95.0 --profile minimal --target '${{ matrix.target }}'
+      - name: Verify minimum and latest Pi compatibility
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          npm ci --prefix integrations/pi
+          npm --prefix integrations/pi test
+          npm --prefix integrations/pi run typecheck
+          npm install --prefix integrations/pi --no-save --package-lock=false @earendil-works/pi-coding-agent@latest
+          npm --prefix integrations/pi test
+          npm --prefix integrations/pi run typecheck
+      - name: Gate Linux managed process retirement and rescue
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          cargo +1.95.0 test --locked -p herdr-a2a-cli \
+            linux_process_proof_tests -- --test-threads=1
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test operations \
+            --features test-harness coordinated_restart_ -- --test-threads=1
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test coordinator \
+            --features test-harness -- --test-threads=1
+          test -x target/debug/herdr-a2a
+          test "$(stat -c %s target/debug/herdr-a2a)" -le 67108864
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test managed_install \
+            --features test-harness managed_remove_stops_every_exact_registered_workspace -- --exact --test-threads=1
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test managed_install \
+            --features test-harness managed_remove_reconciles_an_authenticated_fully_retired_registration -- --exact --test-threads=1
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test managed_install \
+            --features test-harness source_only_rescue_fails_closed_without_starting_an_interpreter_or_disclosing_a_path -- --exact --test-threads=1
+      - name: Gate macOS coordinated restart recovery
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test operations \
+            --features test-harness coordinated_restart_ -- --test-threads=1
+          cargo +1.95.0 test --locked -p herdr-a2a-cli --test coordinator \
+            --features test-harness -- --test-threads=1
+      - name: Build native release binary
+        shell: bash
+        run: CARGO_BUILD_JOBS=2 cargo +1.95.0 build --locked --release --target '${{ matrix.target }}' -p herdr-a2a-cli
+      - name: Package reproducible release
+        shell: bash
+        run: |
+          bash scripts/package-release.sh \
+            --target '${{ matrix.target }}' \
+            --binary 'target/${{ matrix.target }}/release/herdr-a2a' \
+            --output-dir dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: artifacts
+      - name: Publish signed-tag artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find artifacts -type f -print | sort)
+          test "${#files[@]}" -eq 16
+          printf '%s\n' \
+            'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09' \
+            'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID8mhKoSvoSEzgN45bawiPh6UWKe+I5PRWkrhrswRwTL' \
+            > "$RUNNER_TEMP/herdr-a2a-allowed-signers"
+          bash scripts/verify-release-tag.sh \
+            --tag "$GITHUB_REF_NAME" \
+            --expected-sha "$GITHUB_SHA" \
+            --allowed-signers "$RUNNER_TEMP/herdr-a2a-allowed-signers"
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            --verify-tag --generate-notes --title "Herdr A2A $GITHUB_REF_NAME"

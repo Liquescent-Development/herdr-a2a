@@ -1,0 +1,41 @@
+id = "herdr.a2a"
+name = "Herdr A2A Broker"
+version = "0.1.5"
+min_herdr_version = "0.8.0"
+description = "Zero-config workspace A2A for managed Pi agents in Herdr."
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "status"
+title = "Herdr A2A status"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["/bin/sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/libexec/herdr-a2a-dispatch\" coordinator dispatch-exec -- status-tui"]
+
+[[build]]
+platforms = ["macos", "linux"]
+command = ["bash", "scripts/install.sh"]
+
+[[startup]]
+command = ["libexec/herdr-a2a-dispatch", "coordinator", "dispatch-exec", "--", "managed", "repair", "--startup"]
+
+[[actions]]
+id = "ensure-broker"
+title = "Ensure workspace A2A broker"
+contexts = ["workspace", "pane"]
+command = ["libexec/herdr-a2a-dispatch", "coordinator", "dispatch-exec", "--", "coordinator", "serve"]
+
+[[actions]]
+id = "setup-dev"
+title = "Build and configure a linked Herdr A2A checkout"
+contexts = ["global"]
+command = ["bash", "scripts/install.sh", "--dev"]
+
+[[events]]
+on = "workspace.closed"
+command = ["libexec/herdr-a2a-dispatch", "coordinator", "dispatch-exec", "--", "coordinator", "stop"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["libexec/herdr-a2a-dispatch", "coordinator", "dispatch-exec", "--", "managed", "repair", "--event"]

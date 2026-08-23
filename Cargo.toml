@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/herdr-a2a-core", "crates/herdr-a2a-broker", "crates/herdr-a2a-cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+a2a = { package = "a2a-lf", version = "=0.3.0" }
+a2a-client = { package = "a2a-client-lf", version = "=0.2.1" }
+a2a-server = { package = "a2a-server-lf", version = "=0.4.1" }
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+futures = "0.3"
+getrandom = "0.3"
+hmac = "0.12.1"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rusqlite = { version = "=0.40.0", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tower = "0.5"
+toml = "0.8"
+uuid = { version = "1", features = ["serde", "v7"] }
