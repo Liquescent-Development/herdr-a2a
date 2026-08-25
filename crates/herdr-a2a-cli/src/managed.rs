@@ -1003,9 +1003,23 @@ pub async fn extract_release(
         .map_err(Into::into)
 }
 
-pub fn validate_plugin_root(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn validate_plugin_root(
+    path: &Path,
+    managed_install: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = require_absolute_normal(path, "plugin root")?;
-    harden_owned_private_directory(&path, "plugin root")?;
+    if managed_install {
+        let boundary = managed_plugin_config_boundary(&path)?;
+        validate_or_harden_directory_chain(
+            &path,
+            DirectoryPolicy::ManagedOwned {
+                boundary: &boundary,
+                final_mode: Some(0o700),
+            },
+        )?;
+    } else {
+        harden_owned_private_directory(&path, "plugin root")?;
+    }
     Ok(())
 }
 
@@ -5218,6 +5232,135 @@ fn require_absolute_normal(path: &Path, label: &str) -> ManagedResult<PathBuf> {
         ));
     }
     Ok(path.to_path_buf())
+}
+
+enum DirectoryPolicy<'a> {
+    ManagedOwned {
+        boundary: &'a Path,
+        final_mode: Option<u32>,
+    },
+}
+
+fn managed_plugin_config_boundary(path: &Path) -> ManagedResult<PathBuf> {
+    let plugin_name = path.file_name();
+    let repository_plugins = path.parent();
+    let checkout = repository_plugins.and_then(Path::parent);
+    let temporary = checkout.and_then(Path::parent);
+    let managed_plugins = temporary.and_then(Path::parent);
+    let config_root = managed_plugins.and_then(Path::parent);
+    let temporary_name = temporary
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str);
+    if plugin_name != Some(std::ffi::OsStr::new("herdr"))
+        || repository_plugins.and_then(Path::file_name) != Some(std::ffi::OsStr::new("plugins"))
+        || checkout.and_then(Path::file_name) != Some(std::ffi::OsStr::new("checkout"))
+        || managed_plugins.and_then(Path::file_name) != Some(std::ffi::OsStr::new("plugins"))
+        || config_root.and_then(Path::file_name) != Some(std::ffi::OsStr::new("herdr"))
+        || !temporary_name.is_some_and(|name| {
+            name.strip_prefix(".tmp-install-")
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+    {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed plugin root does not match the Herdr temporary checkout layout",
+        ));
+    }
+    Ok(config_root.unwrap().to_path_buf())
+}
+
+fn validate_or_harden_directory_chain(
+    path: &Path,
+    policy: DirectoryPolicy<'_>,
+) -> ManagedResult<()> {
+    require_absolute_normal(path, "directory")?;
+    let DirectoryPolicy::ManagedOwned {
+        boundary,
+        final_mode,
+    } = policy;
+    require_absolute_normal(boundary, "managed boundary")?;
+    if !path.starts_with(boundary) {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed boundary is outside the directory path",
+        ));
+    }
+    let boundary_names = normal_components(boundary)?;
+    let names = normal_components(path)?;
+    if names.get(..boundary_names.len()) != Some(boundary_names.as_slice()) {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed boundary is not an exact directory prefix",
+        ));
+    }
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory =
+        File::from(open(Path::new("/"), flags, Mode::empty()).map_err(|error| {
+            ManagedError::new("unsafe_install_path", format!("cannot open root: {error}"))
+        })?);
+    validate_opened_directory(&directory, false)?;
+    for (index, name) in names.iter().enumerate() {
+        directory = File::from(openat(&directory, *name, flags, Mode::empty()).map_err(
+            |error| {
+                ManagedError::new(
+                    "unsafe_install_path",
+                    format!("cannot open a directory component: {error}"),
+                )
+            },
+        )?);
+        let component_count = index + 1;
+        if component_count < boundary_names.len() {
+            validate_opened_directory(&directory, false)?;
+            continue;
+        }
+        let required_mode = (component_count == names.len())
+            .then_some(final_mode)
+            .flatten();
+        harden_opened_managed_directory(&directory, required_mode)?;
+    }
+    Ok(())
+}
+
+fn harden_opened_managed_directory(
+    directory: &File,
+    required_mode: Option<u32>,
+) -> ManagedResult<()> {
+    let metadata = directory.metadata().map_err(|error| {
+        ManagedError::io(
+            "unsafe_install_path",
+            "cannot inspect managed directory",
+            error,
+        )
+    })?;
+    let uid = rustix::process::getuid().as_raw();
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o002 != 0 {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed directory is not exclusively controlled by the current user",
+        ));
+    }
+    let current_mode = metadata.mode() & 0o7777;
+    let protected_mode = required_mode.unwrap_or(current_mode & !0o020);
+    if current_mode != protected_mode {
+        let protected_mode = u16::try_from(protected_mode).map_err(|_| {
+            ManagedError::new("unsafe_install_path", "managed directory mode is invalid")
+        })?;
+        fchmod(directory, Mode::from_bits_retain(protected_mode)).map_err(|error| {
+            ManagedError::new(
+                "unsafe_install_path",
+                format!("cannot protect managed directory: {error}"),
+            )
+        })?;
+        directory.sync_all().map_err(|error| {
+            ManagedError::io(
+                "unsafe_install_path",
+                "cannot sync protected managed directory",
+                error,
+            )
+        })?;
+    }
+    validate_opened_directory(directory, required_mode == Some(0o700))
 }
 
 pub(crate) fn validate_directory_chain(path: &Path, private_final: bool) -> ManagedResult<()> {

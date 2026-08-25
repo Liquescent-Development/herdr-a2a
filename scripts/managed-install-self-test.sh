@@ -18,7 +18,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 chmod 700 "$temporary"
 
-plugin=$temporary/plugin\ with\ spaces
+plugin=$temporary/config\ with\ spaces/herdr/plugins/.tmp-install-987-654/checkout/plugins/herdr
 bundle=$temporary/bundle\ with\ spaces
 home=$temporary/home\ with\ spaces
 plugin_state=$temporary/plugin-state
@@ -72,6 +72,36 @@ for forbidden in cargo node npm; do
         > "$fake_bin/$forbidden"
     chmod 700 "$fake_bin/$forbidden"
 done
+
+managed_checkout_base=$temporary/managed-checkout
+managed_checkout_plugin=$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456/checkout/plugins/herdr
+managed_checkout_home=$temporary/managed-checkout-home
+managed_checkout_state=$temporary/managed-checkout-state
+mkdir -p "$managed_checkout_plugin/scripts" "$managed_checkout_home" "$managed_checkout_state"
+cp "$repository_root/plugins/herdr/scripts/install.sh" \
+    "$managed_checkout_plugin/scripts/install.sh"
+cp "$repository_root/plugins/herdr/scripts/uninstall.sh" \
+    "$managed_checkout_plugin/scripts/uninstall.sh"
+cp "$repository_root/plugins/herdr/herdr-plugin.toml" \
+    "$managed_checkout_plugin/herdr-plugin.toml"
+for directory in \
+    "$managed_checkout_base/config/herdr" \
+    "$managed_checkout_base/config/herdr/plugins" \
+    "$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456" \
+    "$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456/checkout" \
+    "$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456/checkout/plugins" \
+    "$managed_checkout_plugin"
+do
+    chmod 775 "$directory"
+done
+chmod 700 "$managed_checkout_state"
+HOME=$managed_checkout_home PATH=$fake_bin:/usr/bin:/bin \
+HERDR_A2A_INSTALL_BUNDLE=$bundle HERDR_PLUGIN_STATE_DIR=$managed_checkout_state \
+    bash "$managed_checkout_plugin/scripts/install.sh" >/dev/null
+[ "$(find "$managed_checkout_base/config/herdr" -type d -perm -0020 | wc -l | tr -d ' ')" = 0 ] || \
+    fail "managed checkout retained group-writable directories"
+[ "$(find "$managed_checkout_plugin" -maxdepth 0 -type d -perm 0700 -print)" = \
+    "$managed_checkout_plugin" ] || fail "managed plugin root was not hardened to 0700"
 
 dev_repository=$temporary/dev-repository
 dev_plugin=$dev_repository/plugins/herdr
@@ -136,7 +166,7 @@ HOME=$home PATH=$fake_bin:/usr/bin:/bin HERDR_A2A_INSTALL_BUNDLE=$bundle \
 HERDR_PLUGIN_STATE_DIR=$plugin_state \
     bash "$plugin/scripts/install.sh" >/dev/null
 
-production_plugin=$temporary/production-plugin
+production_plugin=$temporary/production-config/herdr/plugins/.tmp-install-246-802/checkout/plugins/herdr
 production_home=$temporary/production-home
 production_state_home=$temporary/production-state-home
 production_bin=$temporary/production-bin

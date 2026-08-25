@@ -4991,6 +4991,212 @@ fn exact_legacy_checkout_package_is_adopted_but_modified_legacy_is_rejected() {
 }
 
 #[test]
+fn managed_plugin_root_hardens_group_writable_herdr_namespace() {
+    // Break caught: Herdr 0.8.2 inherits umask 002 for its managed checkout, so rejecting every
+    // group-writable component makes an ordinary clean Linux plugin installation impossible.
+    let root = Builder::new()
+        .prefix("herdr managed plugin root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let config_parent = base.join("config");
+    let herdr_config = config_parent.join("herdr");
+    let plugin_root = herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins/herdr");
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::set_permissions(&config_parent, fs::Permissions::from_mode(0o755)).unwrap();
+    for directory in [
+        herdr_config.clone(),
+        herdr_config.join("plugins"),
+        herdr_config.join("plugins/.tmp-install-123-456"),
+        herdr_config.join("plugins/.tmp-install-123-456/checkout"),
+        herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins"),
+        plugin_root.clone(),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o775)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args([
+            "managed",
+            "validate-plugin-root",
+            "--managed-install",
+            "--path",
+        ])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "managed plugin-root preparation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&config_parent).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "the strict parent above the Herdr boundary changed"
+    );
+    for directory in [
+        &herdr_config,
+        &herdr_config.join("plugins"),
+        &herdr_config.join("plugins/.tmp-install-123-456"),
+        &herdr_config.join("plugins/.tmp-install-123-456/checkout"),
+        &herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins"),
+    ] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o022,
+            0,
+            "{} remained writable outside its owner",
+            directory.display()
+        );
+    }
+    assert_eq!(
+        fs::metadata(&plugin_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn linked_plugin_root_does_not_harden_group_writable_checkout() {
+    // Break caught: reusing managed preparation for linked development would silently chmod a
+    // user's checkout instead of retaining the strict fail-closed contract.
+    let root = Builder::new()
+        .prefix("herdr linked plugin root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let plugin_root = base.join("checkout/plugins/herdr");
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::set_permissions(&plugin_root, fs::Permissions::from_mode(0o775)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args(["managed", "validate-plugin-root", "--path"])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&plugin_root).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
+}
+
+#[test]
+fn managed_plugin_root_rejects_world_writable_namespace_without_mutation() {
+    // Break caught: treating managed preparation as blanket chmod would accept a namespace that
+    // any local account can replace while the installer is running.
+    let root = Builder::new()
+        .prefix("herdr shared plugin root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let herdr_config = base.join("config/herdr");
+    let plugin_root = herdr_config.join("plugins/.tmp-install-1/checkout/plugins/herdr");
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::set_permissions(&herdr_config, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args([
+            "managed",
+            "validate-plugin-root",
+            "--managed-install",
+            "--path",
+        ])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&herdr_config).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+}
+
+#[test]
+fn managed_plugin_root_requires_exact_herdr_temporary_layout() {
+    // Break caught: deriving a chmod boundary from an approximate path could modify an unrelated
+    // user-owned tree supplied to the hidden validator.
+    for suffix in [
+        "plugins/.tmp-install-/checkout/plugins/herdr",
+        "plugins/not-an-install/checkout/plugins/herdr",
+        "plugins/.tmp-install-1/checkout/plugins/not-herdr",
+    ] {
+        let root = Builder::new()
+            .prefix("herdr malformed plugin root ")
+            .tempdir()
+            .unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let herdr_config = base.join("config/herdr");
+        let plugin_root = herdr_config.join(suffix);
+        fs::create_dir_all(&plugin_root).unwrap();
+        fs::set_permissions(&herdr_config, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+            .args([
+                "managed",
+                "validate-plugin-root",
+                "--managed-install",
+                "--path",
+            ])
+            .arg(&plugin_root)
+            .output()
+            .unwrap();
+
+        assert_failure_code(&output, "unsafe_install_path");
+        assert_eq!(
+            fs::metadata(&herdr_config).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+    }
+}
+
+#[test]
+fn managed_plugin_root_rejects_symlinked_component_without_mutation() {
+    // Break caught: lexical layout recognition must not permit openat traversal through a link
+    // into another same-user directory.
+    let root = Builder::new()
+        .prefix("herdr linked managed root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let herdr_config = base.join("config/herdr");
+    let temporary = herdr_config.join("plugins/.tmp-install-1");
+    let redirected = base.join("redirected/plugins/herdr");
+    fs::create_dir_all(&temporary).unwrap();
+    fs::create_dir_all(&redirected).unwrap();
+    fs::set_permissions(&redirected, fs::Permissions::from_mode(0o775)).unwrap();
+    symlink(base.join("redirected"), temporary.join("checkout")).unwrap();
+    fs::set_permissions(&herdr_config, fs::Permissions::from_mode(0o775)).unwrap();
+    let plugin_root = temporary.join("checkout/plugins/herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args([
+            "managed",
+            "validate-plugin-root",
+            "--managed-install",
+            "--path",
+        ])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&redirected).unwrap().permissions().mode() & 0o777,
+        0o775,
+        "managed validation mutated a directory reached only through the symlink"
+    );
+    assert!(
+        fs::symlink_metadata(temporary.join("checkout"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn symlinked_or_unsafe_install_paths_are_rejected() {
     // Break caught: following a stable-root symlink or accepting a writable plugin root lets an
     // attacker redirect helper, pointer, and ownership writes.

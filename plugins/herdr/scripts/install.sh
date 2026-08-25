@@ -142,10 +142,10 @@ elif [ "$#" -eq 0 ]; then
         esac
         validator=$bundle/bin/herdr-a2a
         [ -x "$validator" ] || fail "explicit bundle has no native herdr-a2a"
-        "$validator" managed validate-plugin-root --path "$plugin_root"
+        "$validator" managed validate-plugin-root --managed-install --path "$plugin_root"
     else
         download_release_files
-        "$validator" managed validate-plugin-root --path "$plugin_root"
+        "$validator" managed validate-plugin-root --managed-install --path "$plugin_root"
         "$validator" managed extract-release \
             --archive "$release_archive" --destination "$temporary/bundle"
         bundle=$temporary/bundle

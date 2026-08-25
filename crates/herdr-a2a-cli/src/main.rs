@@ -125,6 +125,8 @@ enum ManagedCommands {
     ValidatePluginRoot {
         #[arg(long)]
         path: PathBuf,
+        #[arg(long)]
+        managed_install: bool,
     },
 }
 
@@ -475,7 +477,10 @@ async fn main() {
                 archive,
                 destination,
             } => managed::extract_release(&archive, &destination).await,
-            ManagedCommands::ValidatePluginRoot { path } => managed::validate_plugin_root(&path),
+            ManagedCommands::ValidatePluginRoot {
+                path,
+                managed_install,
+            } => managed::validate_plugin_root(&path, managed_install),
         },
         Commands::ClientSession { harness_session_id } => session::run(harness_session_id).await,
     };
