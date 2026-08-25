@@ -500,6 +500,17 @@ impl ManagedFixture {
         ] {
             fs::create_dir_all(directory).unwrap();
         }
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        for directory in [
+            &home,
+            &data_home,
+            &checkout,
+            &checkout.join("plugins"),
+            &fake_bin,
+            &base.join("state base with spaces"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::set_permissions(&plugin_root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&plugin_state, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
@@ -507,7 +518,17 @@ impl ManagedFixture {
             format!("version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
         )
         .unwrap();
+        fs::set_permissions(
+            plugin_root.join("herdr-plugin.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         fs::create_dir(plugin_root.join("scripts")).unwrap();
+        fs::set_permissions(
+            plugin_root.join("scripts"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         fs::write(
             plugin_root.join("scripts/uninstall.sh"),
             include_bytes!("../../../plugins/herdr/scripts/uninstall.sh"),
@@ -711,6 +732,23 @@ esac
             format!("managed skill {name}\n"),
         )
         .unwrap();
+        for directory in [
+            &bundle,
+            &bundle.join("bin"),
+            &package,
+            &package.join("extensions"),
+            &package.join("skills"),
+            &package.join("skills/herdr-a2a"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for file in [
+            package.join("package.json"),
+            package.join("extensions/herdr-a2a.ts"),
+            package.join("skills/herdr-a2a/SKILL.md"),
+        ] {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         bundle
     }
 
@@ -4999,10 +5037,33 @@ fn managed_plugin_root_hardens_group_writable_herdr_namespace() {
         .tempdir()
         .unwrap();
     let base = root.path().canonicalize().unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
     let config_parent = base.join("config");
     let herdr_config = config_parent.join("herdr");
     let plugin_root = herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins/herdr");
     fs::create_dir_all(&plugin_root).unwrap();
+    fs::write(
+        plugin_root.join("herdr-plugin.toml"),
+        b"version = \"0.1.5\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        plugin_root.join("herdr-plugin.toml"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+    fs::create_dir(plugin_root.join("scripts")).unwrap();
+    fs::write(plugin_root.join("scripts/uninstall.sh"), b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        plugin_root.join("scripts"),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+    fs::set_permissions(
+        plugin_root.join("scripts/uninstall.sh"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
     fs::set_permissions(&config_parent, fs::Permissions::from_mode(0o755)).unwrap();
     for directory in [
         herdr_config.clone(),
@@ -5053,6 +5114,30 @@ fn managed_plugin_root_hardens_group_writable_herdr_namespace() {
     assert_eq!(
         fs::metadata(&plugin_root).unwrap().permissions().mode() & 0o777,
         0o700
+    );
+    assert_eq!(
+        fs::metadata(plugin_root.join("herdr-plugin.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(plugin_root.join("scripts"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(plugin_root.join("scripts/uninstall.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
 }
 
@@ -5221,6 +5306,20 @@ fn linux_umask_002_clean_install_hardens_only_managed_namespaces() {
     let home_mode = fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777;
     let state_base_mode = fs::metadata(&state_base).unwrap().permissions().mode() & 0o777;
     let bundle = fixture.bundle("linux umask 002", "adapter linux umask 002\n");
+    let bundle_binary = fs::metadata(bundle.join("bin/herdr-a2a")).unwrap();
+    assert_eq!(bundle_binary.uid(), rustix::process::getuid().as_raw());
+    assert_eq!(bundle_binary.nlink(), 1);
+    assert_eq!(bundle_binary.mode() & 0o777, 0o700);
+    for file in [
+        bundle.join("pi/package.json"),
+        bundle.join("pi/extensions/herdr-a2a.ts"),
+        bundle.join("pi/skills/herdr-a2a/SKILL.md"),
+    ] {
+        let metadata = fs::metadata(file).unwrap();
+        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+    }
 
     let output = fixture
         .command()

@@ -1017,6 +1017,26 @@ pub fn validate_plugin_root(
                 final_mode: Some(0o700),
             },
         )?;
+        open_owned_regular_file_with_mode(
+            &path.join("herdr-plugin.toml"),
+            &path,
+            0o600,
+            "unsafe_install_path",
+        )?;
+        let scripts = path.join("scripts");
+        validate_or_harden_directory_chain(
+            &scripts,
+            DirectoryPolicy::ManagedOwned {
+                boundary: &path,
+                final_mode: Some(0o700),
+            },
+        )?;
+        open_owned_regular_file_with_mode(
+            &scripts.join("uninstall.sh"),
+            &path,
+            0o600,
+            "unsafe_install_path",
+        )?;
     } else {
         harden_owned_private_directory(&path, "plugin root")?;
     }
@@ -5432,10 +5452,13 @@ fn harden_opened_managed_directory(
     let current_mode = metadata.mode() & 0o7777;
     let protected_mode = required_mode.unwrap_or(current_mode & !0o020);
     if current_mode != protected_mode {
-        let protected_mode = u16::try_from(protected_mode).map_err(|_| {
-            ManagedError::new("unsafe_install_path", "managed directory mode is invalid")
-        })?;
-        fchmod(directory, Mode::from_bits_retain(protected_mode)).map_err(|error| {
+        if protected_mode & !0o7777 != 0 {
+            return Err(ManagedError::new(
+                "unsafe_install_path",
+                "managed directory mode is invalid",
+            ));
+        }
+        fchmod(directory, Mode::from_bits_retain(protected_mode as _)).map_err(|error| {
             ManagedError::new(
                 "unsafe_install_path",
                 format!("cannot protect managed directory: {error}"),
@@ -5607,9 +5630,10 @@ fn open_owned_regular_file_with_mode(
     {
         return Err(ManagedError::new(code, "owned file inode is unsafe"));
     }
-    let mode =
-        u16::try_from(mode).map_err(|_| ManagedError::new(code, "owned file mode is invalid"))?;
-    fchmod(&file, Mode::from_bits_retain(mode))
+    if mode & !0o7777 != 0 {
+        return Err(ManagedError::new(code, "owned file mode is invalid"));
+    }
+    fchmod(&file, Mode::from_bits_retain(mode as _))
         .map_err(|error| ManagedError::new(code, format!("cannot protect owned file: {error}")))?;
     file.sync_all()
         .map_err(|error| ManagedError::io(code, "cannot sync protected owned file", error))?;
@@ -5619,7 +5643,7 @@ fn open_owned_regular_file_with_mode(
     if !metadata.is_file()
         || metadata.uid() != rustix::process::getuid().as_raw()
         || metadata.nlink() != 1
-        || metadata.mode() & 0o777 != u32::from(mode)
+        || metadata.mode() & 0o777 != mode
     {
         return Err(ManagedError::new(
             code,
