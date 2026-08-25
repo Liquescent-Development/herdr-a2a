@@ -489,7 +489,7 @@ impl ManagedFixture {
         let pi_log = base.join("pi.log");
         let herdr_log = base.join("herdr.log");
         let herdr_control = base.join("herdr-control");
-        let plugin_state = base.join("plugin state with spaces");
+        let plugin_state = base.join("state base with spaces/herdr/plugins/herdr.a2a");
         for directory in [
             &home,
             &data_home,
@@ -500,6 +500,17 @@ impl ManagedFixture {
         ] {
             fs::create_dir_all(directory).unwrap();
         }
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        for directory in [
+            &home,
+            &data_home,
+            &checkout,
+            &checkout.join("plugins"),
+            &fake_bin,
+            &base.join("state base with spaces"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::set_permissions(&plugin_root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&plugin_state, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
@@ -507,7 +518,17 @@ impl ManagedFixture {
             format!("version = \"{}\"\n", env!("CARGO_PKG_VERSION")),
         )
         .unwrap();
+        fs::set_permissions(
+            plugin_root.join("herdr-plugin.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         fs::create_dir(plugin_root.join("scripts")).unwrap();
+        fs::set_permissions(
+            plugin_root.join("scripts"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         fs::write(
             plugin_root.join("scripts/uninstall.sh"),
             include_bytes!("../../../plugins/herdr/scripts/uninstall.sh"),
@@ -561,7 +582,7 @@ PY
 esac
 command_name=${1:-}
 source=${2:-}
-settings=$PI_CODING_AGENT_DIR/settings.json
+settings=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json
 case "$command_name" in
   --version)
     printf '%s\n' "${HERDR_A2A_TEST_PI_VERSION:-0.84.2}"
@@ -711,6 +732,23 @@ esac
             format!("managed skill {name}\n"),
         )
         .unwrap();
+        for directory in [
+            &bundle,
+            &bundle.join("bin"),
+            &package,
+            &package.join("extensions"),
+            &package.join("skills"),
+            &package.join("skills/herdr-a2a"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for file in [
+            package.join("package.json"),
+            package.join("extensions/herdr-a2a.ts"),
+            package.join("skills/herdr-a2a/SKILL.md"),
+        ] {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         bundle
     }
 
@@ -4988,6 +5026,502 @@ fn exact_legacy_checkout_package_is_adopted_but_modified_legacy_is_rejected() {
         rejected.packages(),
         [rejected_legacy.to_string_lossy().into_owned()]
     );
+}
+
+#[test]
+fn managed_plugin_root_hardens_group_writable_herdr_namespace() {
+    // Break caught: Herdr 0.8.2 inherits umask 002 for its managed checkout, so rejecting every
+    // group-writable component makes an ordinary clean Linux plugin installation impossible.
+    let root = Builder::new()
+        .prefix("herdr managed plugin root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_parent = base.join("config");
+    let herdr_config = config_parent.join("herdr");
+    let plugin_root = herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins/herdr");
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::write(
+        plugin_root.join("herdr-plugin.toml"),
+        b"version = \"0.1.6\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        plugin_root.join("herdr-plugin.toml"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+    fs::create_dir(plugin_root.join("scripts")).unwrap();
+    fs::write(plugin_root.join("scripts/uninstall.sh"), b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        plugin_root.join("scripts"),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+    fs::set_permissions(
+        plugin_root.join("scripts/uninstall.sh"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+    fs::set_permissions(&config_parent, fs::Permissions::from_mode(0o755)).unwrap();
+    for directory in [
+        herdr_config.clone(),
+        herdr_config.join("plugins"),
+        herdr_config.join("plugins/.tmp-install-123-456"),
+        herdr_config.join("plugins/.tmp-install-123-456/checkout"),
+        herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins"),
+        plugin_root.clone(),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o775)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args([
+            "managed",
+            "validate-plugin-root",
+            "--managed-install",
+            "--path",
+        ])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "managed plugin-root preparation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&config_parent).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "the strict parent above the Herdr boundary changed"
+    );
+    for directory in [
+        &herdr_config,
+        &herdr_config.join("plugins"),
+        &herdr_config.join("plugins/.tmp-install-123-456"),
+        &herdr_config.join("plugins/.tmp-install-123-456/checkout"),
+        &herdr_config.join("plugins/.tmp-install-123-456/checkout/plugins"),
+    ] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o022,
+            0,
+            "{} remained writable outside its owner",
+            directory.display()
+        );
+    }
+    assert_eq!(
+        fs::metadata(&plugin_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(plugin_root.join("herdr-plugin.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(plugin_root.join("scripts"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(plugin_root.join("scripts/uninstall.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn linked_plugin_root_does_not_harden_group_writable_checkout() {
+    // Break caught: reusing managed preparation for linked development would silently chmod a
+    // user's checkout instead of retaining the strict fail-closed contract.
+    let root = Builder::new()
+        .prefix("herdr linked plugin root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let plugin_root = base.join("checkout/plugins/herdr");
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::set_permissions(&plugin_root, fs::Permissions::from_mode(0o775)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args(["managed", "validate-plugin-root", "--path"])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&plugin_root).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
+}
+
+#[test]
+fn managed_plugin_root_rejects_world_writable_namespace_without_mutation() {
+    // Break caught: treating managed preparation as blanket chmod would accept a namespace that
+    // any local account can replace while the installer is running.
+    let root = Builder::new()
+        .prefix("herdr shared plugin root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let herdr_config = base.join("config/herdr");
+    let plugin_root = herdr_config.join("plugins/.tmp-install-1/checkout/plugins/herdr");
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::set_permissions(&herdr_config, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args([
+            "managed",
+            "validate-plugin-root",
+            "--managed-install",
+            "--path",
+        ])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&herdr_config).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+}
+
+#[test]
+fn managed_plugin_root_requires_exact_herdr_temporary_layout() {
+    // Break caught: deriving a chmod boundary from an approximate path could modify an unrelated
+    // user-owned tree supplied to the hidden validator.
+    for suffix in [
+        "plugins/.tmp-install-/checkout/plugins/herdr",
+        "plugins/not-an-install/checkout/plugins/herdr",
+        "plugins/.tmp-install-1/checkout/plugins/not-herdr",
+    ] {
+        let root = Builder::new()
+            .prefix("herdr malformed plugin root ")
+            .tempdir()
+            .unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let herdr_config = base.join("config/herdr");
+        let plugin_root = herdr_config.join(suffix);
+        fs::create_dir_all(&plugin_root).unwrap();
+        fs::set_permissions(&herdr_config, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+            .args([
+                "managed",
+                "validate-plugin-root",
+                "--managed-install",
+                "--path",
+            ])
+            .arg(&plugin_root)
+            .output()
+            .unwrap();
+
+        assert_failure_code(&output, "unsafe_install_path");
+        assert_eq!(
+            fs::metadata(&herdr_config).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+    }
+}
+
+#[test]
+fn managed_plugin_root_rejects_symlinked_component_without_mutation() {
+    // Break caught: lexical layout recognition must not permit openat traversal through a link
+    // into another same-user directory.
+    let root = Builder::new()
+        .prefix("herdr linked managed root ")
+        .tempdir()
+        .unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let herdr_config = base.join("config/herdr");
+    let temporary = herdr_config.join("plugins/.tmp-install-1");
+    let redirected = base.join("redirected/plugins/herdr");
+    fs::create_dir_all(&temporary).unwrap();
+    fs::create_dir_all(&redirected).unwrap();
+    fs::set_permissions(&redirected, fs::Permissions::from_mode(0o775)).unwrap();
+    symlink(base.join("redirected"), temporary.join("checkout")).unwrap();
+    fs::set_permissions(&herdr_config, fs::Permissions::from_mode(0o775)).unwrap();
+    let plugin_root = temporary.join("checkout/plugins/herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-a2a"))
+        .args([
+            "managed",
+            "validate-plugin-root",
+            "--managed-install",
+            "--path",
+        ])
+        .arg(&plugin_root)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&redirected).unwrap().permissions().mode() & 0o777,
+        0o775,
+        "managed validation mutated a directory reached only through the symlink"
+    );
+    assert!(
+        fs::symlink_metadata(temporary.join("checkout"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn linux_umask_002_clean_install_hardens_only_managed_namespaces() {
+    // Break caught: an ordinary private-primary-group Linux account creates Pi configuration at
+    // 0775/0664 and has no plugin-state directory before Herdr runs the plugin build.
+    let fixture = ManagedFixture::new();
+    let pi_root = fixture.home.join(".pi");
+    let pi_agent = pi_root.join("agent");
+    let pi_settings = pi_agent.join("settings.json");
+    fs::create_dir_all(&pi_agent).unwrap();
+    fs::write(
+        &pi_settings,
+        serde_json::to_vec_pretty(&json!({ "packages": [] })).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&pi_root, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::set_permissions(&pi_agent, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::set_permissions(&pi_settings, fs::Permissions::from_mode(0o664)).unwrap();
+
+    let state_base = fixture.base.join("managed state base");
+    let plugin_state = state_base.join("herdr/plugins/herdr.a2a");
+    fs::create_dir(&state_base).unwrap();
+    fs::set_permissions(&state_base, fs::Permissions::from_mode(0o755)).unwrap();
+    let home_mode = fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777;
+    let state_base_mode = fs::metadata(&state_base).unwrap().permissions().mode() & 0o777;
+    let bundle = fixture.bundle("linux umask 002", "adapter linux umask 002\n");
+    let bundle_binary = fs::metadata(bundle.join("bin/herdr-a2a")).unwrap();
+    assert_eq!(bundle_binary.uid(), rustix::process::getuid().as_raw());
+    assert_eq!(bundle_binary.nlink(), 1);
+    assert_eq!(bundle_binary.mode() & 0o777, 0o700);
+    for file in [
+        bundle.join("pi/package.json"),
+        bundle.join("pi/extensions/herdr-a2a.ts"),
+        bundle.join("pi/skills/herdr-a2a/SKILL.md"),
+    ] {
+        let metadata = fs::metadata(file).unwrap();
+        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+    }
+
+    let output = fixture
+        .command()
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+        .env("HERDR_A2A_INSTALL_KIND", "managed")
+        .args(["managed", "install", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(fixture.record_state(), "Ready");
+    for directory in [&pi_root, &pi_agent, &plugin_state] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{} was not made private",
+            directory.display()
+        );
+    }
+    assert_eq!(
+        fs::metadata(&pi_settings).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777,
+        home_mode,
+        "HOME permissions changed"
+    );
+    assert_eq!(
+        fs::metadata(&state_base).unwrap().permissions().mode() & 0o777,
+        state_base_mode,
+        "state base permissions changed"
+    );
+}
+
+#[test]
+fn managed_pi_rejects_world_writable_namespace_without_mutation() {
+    // Break caught: managed hardening may remove private-group write, but must never repair a
+    // namespace writable by every local account.
+    let fixture = ManagedFixture::new();
+    let pi_root = fixture.home.join(".pi");
+    let pi_agent = pi_root.join("agent");
+    let pi_settings = pi_agent.join("settings.json");
+    let settings_bytes = serde_json::to_vec_pretty(&json!({ "packages": [] })).unwrap();
+    fs::create_dir_all(&pi_agent).unwrap();
+    fs::write(&pi_settings, &settings_bytes).unwrap();
+    fs::set_permissions(&pi_root, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&pi_agent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&pi_settings, fs::Permissions::from_mode(0o600)).unwrap();
+    let bundle = fixture.bundle("unsafe Pi namespace", "unsafe Pi namespace\n");
+
+    let output = fixture
+        .command()
+        .env_remove("PI_CODING_AGENT_DIR")
+        .args(["managed", "install", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "unsafe_install_path");
+    assert_eq!(
+        fs::metadata(&pi_root).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    assert_eq!(fs::read(&pi_settings).unwrap(), settings_bytes);
+}
+
+#[test]
+fn managed_pi_rejects_linked_settings_without_mutating_the_inode() {
+    // Break caught: chmod-before-identity-validation would modify a multiply linked settings inode.
+    let fixture = ManagedFixture::new();
+    let pi_root = fixture.home.join(".pi");
+    let pi_agent = pi_root.join("agent");
+    let pi_settings = pi_agent.join("settings.json");
+    let second_link = fixture.base.join("second settings link");
+    fs::create_dir_all(&pi_agent).unwrap();
+    fs::write(&pi_settings, b"{\"packages\": []}\n").unwrap();
+    fs::set_permissions(&pi_root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&pi_agent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&pi_settings, fs::Permissions::from_mode(0o664)).unwrap();
+    fs::hard_link(&pi_settings, &second_link).unwrap();
+    let bundle = fixture.bundle("linked Pi settings", "linked Pi settings\n");
+
+    let output = fixture
+        .command()
+        .env_remove("PI_CODING_AGENT_DIR")
+        .args(["managed", "install", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "pi_settings_unsafe");
+    assert_eq!(
+        fs::metadata(&pi_settings).unwrap().permissions().mode() & 0o777,
+        0o664
+    );
+    assert_eq!(fs::metadata(&pi_settings).unwrap().nlink(), 2);
+}
+
+#[test]
+fn managed_pi_rejects_symlinked_settings_without_mutating_the_target() {
+    // Break caught: settings preparation must remain descriptor-relative and NOFOLLOW.
+    let fixture = ManagedFixture::new();
+    let pi_root = fixture.home.join(".pi");
+    let pi_agent = pi_root.join("agent");
+    let pi_settings = pi_agent.join("settings.json");
+    let target = fixture.base.join("redirected settings.json");
+    let target_bytes = b"{\"packages\": [\"unrelated\"]}\n";
+    fs::create_dir_all(&pi_agent).unwrap();
+    fs::write(&target, target_bytes).unwrap();
+    fs::set_permissions(&pi_root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&pi_agent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+    symlink(&target, &pi_settings).unwrap();
+    let bundle = fixture.bundle("symlinked Pi settings", "symlinked Pi settings\n");
+
+    let output = fixture
+        .command()
+        .env_remove("PI_CODING_AGENT_DIR")
+        .args(["managed", "install", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "pi_settings_unsafe");
+    assert_eq!(fs::read(&target).unwrap(), target_bytes);
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o664
+    );
+    assert!(
+        fs::symlink_metadata(&pi_settings)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn managed_plugin_state_rejects_unbounded_or_linked_namespaces_without_mutation() {
+    // Break caught: plugin-state creation is permitted only in the exact managed namespace, and
+    // linked development must retain its pre-existing strict-directory contract.
+    for case in ["malformed", "unsafe-parent", "linked-dev"] {
+        let fixture = ManagedFixture::new();
+        let bundle = fixture.bundle(case, &format!("plugin state {case}\n"));
+        let state_base = fixture.base.join(format!("state discriminator {case}"));
+        fs::create_dir(&state_base).unwrap();
+        fs::set_permissions(&state_base, fs::Permissions::from_mode(0o755)).unwrap();
+        let (plugin_state, install_kind) = match case {
+            "malformed" => (state_base.join("not-herdr/plugins/herdr.a2a"), "managed"),
+            "unsafe-parent" => {
+                fs::set_permissions(&state_base, fs::Permissions::from_mode(0o777)).unwrap();
+                (state_base.join("herdr/plugins/herdr.a2a"), "managed")
+            }
+            "linked-dev" => {
+                let state = state_base.join("linked state");
+                fs::create_dir(&state).unwrap();
+                fs::set_permissions(&state, fs::Permissions::from_mode(0o775)).unwrap();
+                (state, "linked-dev")
+            }
+            _ => unreachable!(),
+        };
+        let before_mode = fs::metadata(&state_base).unwrap().permissions().mode() & 0o777;
+
+        let output = fixture
+            .command()
+            .env("HERDR_PLUGIN_STATE_DIR", &plugin_state)
+            .env("HERDR_A2A_INSTALL_KIND", install_kind)
+            .args(["managed", "install", "--bundle"])
+            .arg(&bundle)
+            .output()
+            .unwrap();
+
+        assert_failure_code(&output, "unsafe_install_path");
+        assert_eq!(
+            fs::metadata(&state_base).unwrap().permissions().mode() & 0o777,
+            before_mode,
+            "{case} changed the strict state parent"
+        );
+        if case == "linked-dev" {
+            assert_eq!(
+                fs::metadata(&plugin_state).unwrap().permissions().mode() & 0o777,
+                0o775
+            );
+        } else {
+            assert!(!plugin_state.exists(), "{case} created plugin-state data");
+            assert_eq!(
+                fs::read_dir(&state_base).unwrap().count(),
+                0,
+                "{case} created a sibling inside the strict state parent"
+            );
+        }
+        assert!(
+            !fixture
+                .plugin_root
+                .join("libexec/herdr-a2a-dispatch")
+                .exists()
+        );
+        assert!(!fixture.plugin_root.join("stable-bin-path").exists());
+    }
 }
 
 #[test]

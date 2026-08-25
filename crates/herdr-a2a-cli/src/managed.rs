@@ -1003,9 +1003,43 @@ pub async fn extract_release(
         .map_err(Into::into)
 }
 
-pub fn validate_plugin_root(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn validate_plugin_root(
+    path: &Path,
+    managed_install: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = require_absolute_normal(path, "plugin root")?;
-    harden_owned_private_directory(&path, "plugin root")?;
+    if managed_install {
+        let boundary = managed_plugin_config_boundary(&path)?;
+        validate_or_harden_directory_chain(
+            &path,
+            DirectoryPolicy::ManagedOwned {
+                boundary: &boundary,
+                final_mode: Some(0o700),
+            },
+        )?;
+        open_owned_regular_file_with_mode(
+            &path.join("herdr-plugin.toml"),
+            &path,
+            0o600,
+            "unsafe_install_path",
+        )?;
+        let scripts = path.join("scripts");
+        validate_or_harden_directory_chain(
+            &scripts,
+            DirectoryPolicy::ManagedOwned {
+                boundary: &path,
+                final_mode: Some(0o700),
+            },
+        )?;
+        open_owned_regular_file_with_mode(
+            &scripts.join("uninstall.sh"),
+            &path,
+            0o600,
+            "unsafe_install_path",
+        )?;
+    } else {
+        harden_owned_private_directory(&path, "plugin root")?;
+    }
     Ok(())
 }
 
@@ -3099,7 +3133,7 @@ fn build_record(
     owned_files.push(owned_file(&pointer, 0o600)?);
     owned_files.sort_by(|left, right| left.path.cmp(&right.path));
     let (purge_authority, plugin_state_root) = match prior {
-        None => (true, required_plugin_state_root()?),
+        None => (true, required_plugin_state_root(&install_kind)?),
         Some(record) if record.purge_authority => {
             validate_private_directory(&record.plugin_state_root, 0o700)?;
             (true, record.plugin_state_root.clone())
@@ -5145,7 +5179,7 @@ fn required_plugin_root() -> ManagedResult<PathBuf> {
     require_absolute_normal(Path::new(&root), "HERDR_A2A_PLUGIN_ROOT")
 }
 
-fn required_plugin_state_root() -> ManagedResult<PathBuf> {
+fn required_plugin_state_root(install_kind: &str) -> ManagedResult<PathBuf> {
     let root = env::var_os("HERDR_PLUGIN_STATE_DIR")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -5155,8 +5189,75 @@ fn required_plugin_state_root() -> ManagedResult<PathBuf> {
             )
         })?;
     let root = require_absolute_normal(Path::new(&root), "HERDR_PLUGIN_STATE_DIR")?;
-    harden_owned_private_directory(&root, "plugin-state directory")?;
+    if install_kind == "managed" {
+        prepare_managed_plugin_state_root(&root)?;
+    } else {
+        harden_owned_private_directory(&root, "plugin-state directory")?;
+    }
     Ok(root)
+}
+
+fn prepare_managed_plugin_state_root(path: &Path) -> ManagedResult<()> {
+    let plugin_name = path.file_name();
+    let plugins = path.parent();
+    let herdr = plugins.and_then(Path::parent);
+    let strict_parent = herdr.and_then(Path::parent);
+    if plugin_name != Some(OsStr::new("herdr.a2a"))
+        || plugins.and_then(Path::file_name) != Some(OsStr::new("plugins"))
+        || herdr.and_then(Path::file_name) != Some(OsStr::new("herdr"))
+    {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed plugin-state root does not match the Herdr plugin namespace",
+        ));
+    }
+    let strict_parent = strict_parent.ok_or_else(|| {
+        ManagedError::new(
+            "unsafe_install_path",
+            "managed plugin-state root has no strict parent",
+        )
+    })?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = open_strict_directory_chain(strict_parent)?;
+    for name in [
+        OsStr::new("herdr"),
+        OsStr::new("plugins"),
+        OsStr::new("herdr.a2a"),
+    ] {
+        let opened = match openat(&directory, name, flags, Mode::empty()) {
+            Ok(opened) => opened,
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                mkdirat(&directory, name, Mode::from_bits_retain(0o700)).map_err(|error| {
+                    ManagedError::new(
+                        "unsafe_install_path",
+                        format!("cannot create managed plugin-state directory: {error}"),
+                    )
+                })?;
+                directory.sync_all().map_err(|error| {
+                    ManagedError::io(
+                        "unsafe_install_path",
+                        "cannot sync managed plugin-state parent",
+                        error,
+                    )
+                })?;
+                openat(&directory, name, flags, Mode::empty()).map_err(|error| {
+                    ManagedError::new(
+                        "unsafe_install_path",
+                        format!("cannot open created plugin-state directory: {error}"),
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(ManagedError::new(
+                    "unsafe_install_path",
+                    format!("cannot open managed plugin-state directory: {error}"),
+                ));
+            }
+        };
+        directory = File::from(opened);
+        harden_opened_managed_directory(&directory, Some(0o700))?;
+    }
+    Ok(())
 }
 
 fn harden_owned_private_directory(path: &Path, label: &str) -> ManagedResult<()> {
@@ -5218,6 +5319,160 @@ fn require_absolute_normal(path: &Path, label: &str) -> ManagedResult<PathBuf> {
         ));
     }
     Ok(path.to_path_buf())
+}
+
+enum DirectoryPolicy<'a> {
+    ManagedOwned {
+        boundary: &'a Path,
+        final_mode: Option<u32>,
+    },
+}
+
+fn managed_plugin_config_boundary(path: &Path) -> ManagedResult<PathBuf> {
+    let plugin_name = path.file_name();
+    let repository_plugins = path.parent();
+    let checkout = repository_plugins.and_then(Path::parent);
+    let temporary = checkout.and_then(Path::parent);
+    let managed_plugins = temporary.and_then(Path::parent);
+    let config_root = managed_plugins.and_then(Path::parent);
+    let temporary_name = temporary
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str);
+    if plugin_name != Some(std::ffi::OsStr::new("herdr"))
+        || repository_plugins.and_then(Path::file_name) != Some(std::ffi::OsStr::new("plugins"))
+        || checkout.and_then(Path::file_name) != Some(std::ffi::OsStr::new("checkout"))
+        || managed_plugins.and_then(Path::file_name) != Some(std::ffi::OsStr::new("plugins"))
+        || config_root.and_then(Path::file_name) != Some(std::ffi::OsStr::new("herdr"))
+        || !temporary_name.is_some_and(|name| {
+            name.strip_prefix(".tmp-install-")
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+    {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed plugin root does not match the Herdr temporary checkout layout",
+        ));
+    }
+    Ok(config_root.unwrap().to_path_buf())
+}
+
+fn validate_or_harden_directory_chain(
+    path: &Path,
+    policy: DirectoryPolicy<'_>,
+) -> ManagedResult<()> {
+    require_absolute_normal(path, "directory")?;
+    let DirectoryPolicy::ManagedOwned {
+        boundary,
+        final_mode,
+    } = policy;
+    require_absolute_normal(boundary, "managed boundary")?;
+    if !path.starts_with(boundary) {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed boundary is outside the directory path",
+        ));
+    }
+    let boundary_names = normal_components(boundary)?;
+    let names = normal_components(path)?;
+    if names.get(..boundary_names.len()) != Some(boundary_names.as_slice()) {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed boundary is not an exact directory prefix",
+        ));
+    }
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory =
+        File::from(open(Path::new("/"), flags, Mode::empty()).map_err(|error| {
+            ManagedError::new("unsafe_install_path", format!("cannot open root: {error}"))
+        })?);
+    validate_opened_directory(&directory, false)?;
+    for (index, name) in names.iter().enumerate() {
+        directory = File::from(openat(&directory, *name, flags, Mode::empty()).map_err(
+            |error| {
+                ManagedError::new(
+                    "unsafe_install_path",
+                    format!("cannot open a directory component: {error}"),
+                )
+            },
+        )?);
+        let component_count = index + 1;
+        if component_count < boundary_names.len() {
+            validate_opened_directory(&directory, false)?;
+            continue;
+        }
+        let required_mode = (component_count == names.len())
+            .then_some(final_mode)
+            .flatten();
+        harden_opened_managed_directory(&directory, required_mode)?;
+    }
+    Ok(())
+}
+
+fn open_strict_directory_chain(path: &Path) -> ManagedResult<File> {
+    require_absolute_normal(path, "directory")?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory =
+        File::from(open(Path::new("/"), flags, Mode::empty()).map_err(|error| {
+            ManagedError::new("unsafe_install_path", format!("cannot open root: {error}"))
+        })?);
+    validate_opened_directory(&directory, false)?;
+    for name in normal_components(path)? {
+        directory = File::from(openat(&directory, name, flags, Mode::empty()).map_err(
+            |error| {
+                ManagedError::new(
+                    "unsafe_install_path",
+                    format!("cannot open a directory component: {error}"),
+                )
+            },
+        )?);
+        validate_opened_directory(&directory, false)?;
+    }
+    Ok(directory)
+}
+
+fn harden_opened_managed_directory(
+    directory: &File,
+    required_mode: Option<u32>,
+) -> ManagedResult<()> {
+    let metadata = directory.metadata().map_err(|error| {
+        ManagedError::io(
+            "unsafe_install_path",
+            "cannot inspect managed directory",
+            error,
+        )
+    })?;
+    let uid = rustix::process::getuid().as_raw();
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o002 != 0 {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "managed directory is not exclusively controlled by the current user",
+        ));
+    }
+    let current_mode = metadata.mode() & 0o7777;
+    let protected_mode = required_mode.unwrap_or(current_mode & !0o020);
+    if current_mode != protected_mode {
+        if protected_mode & !0o7777 != 0 {
+            return Err(ManagedError::new(
+                "unsafe_install_path",
+                "managed directory mode is invalid",
+            ));
+        }
+        fchmod(directory, Mode::from_bits_retain(protected_mode as _)).map_err(|error| {
+            ManagedError::new(
+                "unsafe_install_path",
+                format!("cannot protect managed directory: {error}"),
+            )
+        })?;
+        directory.sync_all().map_err(|error| {
+            ManagedError::io(
+                "unsafe_install_path",
+                "cannot sync protected managed directory",
+                error,
+            )
+        })?;
+    }
+    validate_opened_directory(directory, required_mode == Some(0o700))
 }
 
 pub(crate) fn validate_directory_chain(path: &Path, private_final: bool) -> ManagedResult<()> {
@@ -5322,6 +5577,79 @@ fn open_validated_absolute_file(path: &Path) -> ManagedResult<File> {
             )
         })?,
     );
+    Ok(file)
+}
+
+fn open_owned_regular_file_with_mode(
+    path: &Path,
+    boundary: &Path,
+    mode: u32,
+    code: &'static str,
+) -> ManagedResult<File> {
+    let path = require_absolute_normal(path, "owned file")?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ManagedError::new(code, "owned file has no parent directory"))?;
+    validate_or_harden_directory_chain(
+        boundary,
+        DirectoryPolicy::ManagedOwned {
+            boundary,
+            final_mode: Some(0o700),
+        },
+    )?;
+    if parent != boundary {
+        validate_or_harden_directory_chain(
+            parent,
+            DirectoryPolicy::ManagedOwned {
+                boundary,
+                final_mode: Some(0o700),
+            },
+        )?;
+    }
+
+    let directory = open_strict_directory_chain(parent)?;
+    let final_name = path
+        .file_name()
+        .ok_or_else(|| ManagedError::new(code, "owned file path has no final component"))?;
+    let file = File::from(
+        openat(
+            &directory,
+            final_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| ManagedError::new(code, format!("cannot open owned file: {error}")))?,
+    );
+    let metadata = file
+        .metadata()
+        .map_err(|error| ManagedError::io(code, "cannot inspect owned file", error))?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::getuid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o002 != 0
+    {
+        return Err(ManagedError::new(code, "owned file inode is unsafe"));
+    }
+    if mode & !0o7777 != 0 {
+        return Err(ManagedError::new(code, "owned file mode is invalid"));
+    }
+    fchmod(&file, Mode::from_bits_retain(mode as _))
+        .map_err(|error| ManagedError::new(code, format!("cannot protect owned file: {error}")))?;
+    file.sync_all()
+        .map_err(|error| ManagedError::io(code, "cannot sync protected owned file", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ManagedError::io(code, "cannot re-inspect protected owned file", error))?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::getuid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != mode
+    {
+        return Err(ManagedError::new(
+            code,
+            "protected owned file failed revalidation",
+        ));
+    }
     Ok(file)
 }
 
@@ -5874,32 +6202,51 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         })
 }
 
-fn pi_settings_path() -> ManagedResult<PathBuf> {
-    let agent_dir = match env::var_os("PI_CODING_AGENT_DIR") {
+fn pi_settings_location() -> ManagedResult<(PathBuf, PathBuf)> {
+    let (agent_dir, boundary) = match env::var_os("PI_CODING_AGENT_DIR") {
         Some(value) if !value.is_empty() => {
-            require_absolute_normal(Path::new(&value), "PI_CODING_AGENT_DIR")?
+            let agent_dir = require_absolute_normal(Path::new(&value), "PI_CODING_AGENT_DIR")?;
+            (agent_dir.clone(), agent_dir)
         }
-        _ => required_home()?.join(".pi/agent"),
+        _ => {
+            let pi_root = required_home()?.join(".pi");
+            (pi_root.join("agent"), pi_root)
+        }
     };
-    Ok(agent_dir.join("settings.json"))
+    Ok((agent_dir.join("settings.json"), boundary))
+}
+
+fn pi_settings_path() -> ManagedResult<PathBuf> {
+    pi_settings_location().map(|(path, _)| path)
 }
 
 fn read_pi_settings() -> ManagedResult<PiSettings> {
-    let settings = pi_settings_path()?;
-    if !settings.exists() {
-        return Ok(PiSettings {
-            path: settings,
-            entries: Vec::new(),
-        });
+    let (settings, boundary) = pi_settings_location()?;
+    match fs::symlink_metadata(&settings) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(PiSettings {
+                path: settings,
+                entries: Vec::new(),
+            });
+        }
+        Err(error) => {
+            return Err(ManagedError::io(
+                "pi_settings_unsafe",
+                "cannot inspect Pi settings path",
+                error,
+            ));
+        }
     }
-    let mut file = open_validated_absolute_file(&settings)?;
+    let mut file =
+        open_owned_regular_file_with_mode(&settings, &boundary, 0o600, "pi_settings_unsafe")?;
     let metadata = file.metadata().map_err(|error| {
         ManagedError::io("pi_settings_unsafe", "cannot inspect settings", error)
     })?;
     if !metadata.is_file()
         || metadata.uid() != rustix::process::getuid().as_raw()
         || metadata.nlink() != 1
-        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o777 != 0o600
     {
         return Err(ManagedError::new(
             "pi_settings_unsafe",

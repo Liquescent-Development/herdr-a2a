@@ -18,10 +18,10 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 chmod 700 "$temporary"
 
-plugin=$temporary/plugin\ with\ spaces
+plugin=$temporary/config\ with\ spaces/herdr/plugins/.tmp-install-987-654/checkout/plugins/herdr
 bundle=$temporary/bundle\ with\ spaces
 home=$temporary/home\ with\ spaces
-plugin_state=$temporary/plugin-state
+plugin_state=$temporary/plugin-state-base/herdr/plugins/herdr.a2a
 fake_bin=$temporary/fake-bin
 mkdir -p "$plugin/scripts" "$bundle/bin" "$bundle/pi/extensions" \
     "$bundle/pi/src" "$bundle/pi/skills/herdr-a2a" "$home" "$plugin_state" "$fake_bin"
@@ -72,6 +72,91 @@ for forbidden in cargo node npm; do
         > "$fake_bin/$forbidden"
     chmod 700 "$fake_bin/$forbidden"
 done
+
+managed_checkout_base=$temporary/managed-checkout
+managed_checkout_plugin=$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456/checkout/plugins/herdr
+managed_checkout_home=$temporary/managed-checkout-home
+managed_checkout_state_base=$temporary/managed-checkout-state-base
+managed_checkout_state=$managed_checkout_state_base/herdr/plugins/herdr.a2a
+managed_checkout_bin=$temporary/managed-checkout-bin
+managed_checkout_python=$(command -v python3) || fail "python3 is required for the clean-install fixture"
+mkdir -p "$managed_checkout_plugin/scripts" "$managed_checkout_home/.pi/agent" \
+    "$managed_checkout_state_base" "$managed_checkout_bin"
+cp "$repository_root/plugins/herdr/scripts/install.sh" \
+    "$managed_checkout_plugin/scripts/install.sh"
+cp "$repository_root/plugins/herdr/scripts/uninstall.sh" \
+    "$managed_checkout_plugin/scripts/uninstall.sh"
+cp "$repository_root/plugins/herdr/herdr-plugin.toml" \
+    "$managed_checkout_plugin/herdr-plugin.toml"
+chmod 664 "$managed_checkout_plugin/herdr-plugin.toml"
+chmod 775 "$managed_checkout_plugin/scripts"
+chmod 664 "$managed_checkout_plugin/scripts/uninstall.sh"
+printf '%s\n' '{"packages": []}' > "$managed_checkout_home/.pi/agent/settings.json"
+cat > "$managed_checkout_bin/pi" <<'SH'
+#!/bin/sh
+set -eu
+case "${1:-}" in
+    --version) printf '%s\n' 0.84.2 ;;
+    install)
+        "$HERDR_A2A_TEST_PYTHON" - "$HOME/.pi/agent/settings.json" "$2" <<'PY'
+import json, os, sys, tempfile
+path, source = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    value = json.load(handle)
+value.setdefault("packages", []).append(source)
+fd, temporary = tempfile.mkstemp(prefix=".settings-", dir=os.path.dirname(path))
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(value, handle)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, path)
+PY
+        ;;
+    list) ;;
+    *) exit 64 ;;
+esac
+SH
+chmod 700 "$managed_checkout_bin/pi"
+for directory in \
+    "$managed_checkout_base/config/herdr" \
+    "$managed_checkout_base/config/herdr/plugins" \
+    "$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456" \
+    "$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456/checkout" \
+    "$managed_checkout_base/config/herdr/plugins/.tmp-install-123-456/checkout/plugins" \
+    "$managed_checkout_plugin"
+do
+    chmod 775 "$directory"
+done
+chmod 775 "$managed_checkout_home/.pi" "$managed_checkout_home/.pi/agent"
+chmod 664 "$managed_checkout_home/.pi/agent/settings.json"
+chmod 755 "$managed_checkout_state_base"
+(
+    umask 002
+    HOME=$managed_checkout_home PATH=$managed_checkout_bin:/usr/bin:/bin \
+    HERDR_A2A_TEST_PYTHON=$managed_checkout_python \
+    HERDR_A2A_INSTALL_BUNDLE=$bundle HERDR_PLUGIN_STATE_DIR=$managed_checkout_state \
+        bash "$managed_checkout_plugin/scripts/install.sh" >/dev/null
+)
+[ "$(find "$managed_checkout_base/config/herdr" -type d -perm -0020 | wc -l | tr -d ' ')" = 0 ] || \
+    fail "managed checkout retained group-writable directories"
+[ "$(find "$managed_checkout_plugin" -maxdepth 0 -type d -perm 0700 -print)" = \
+    "$managed_checkout_plugin" ] || fail "managed plugin root was not hardened to 0700"
+for private_directory in \
+    "$managed_checkout_home/.pi" \
+    "$managed_checkout_home/.pi/agent" \
+    "$managed_checkout_state_base/herdr" \
+    "$managed_checkout_state_base/herdr/plugins" \
+    "$managed_checkout_state"
+do
+    [ "$(find "$private_directory" -maxdepth 0 -type d -perm 0700 -print)" = \
+        "$private_directory" ] || fail "clean-install directory is not private: $private_directory"
+done
+[ "$(find "$managed_checkout_home/.pi/agent/settings.json" -type f -perm 0600 -print)" = \
+    "$managed_checkout_home/.pi/agent/settings.json" ] || \
+    fail "clean-install Pi settings are not private"
+[ "$(find "$managed_checkout_state_base" -maxdepth 0 -type d -perm 0755 -print)" = \
+    "$managed_checkout_state_base" ] || fail "managed install changed the state base"
 
 dev_repository=$temporary/dev-repository
 dev_plugin=$dev_repository/plugins/herdr
@@ -136,7 +221,7 @@ HOME=$home PATH=$fake_bin:/usr/bin:/bin HERDR_A2A_INSTALL_BUNDLE=$bundle \
 HERDR_PLUGIN_STATE_DIR=$plugin_state \
     bash "$plugin/scripts/install.sh" >/dev/null
 
-production_plugin=$temporary/production-plugin
+production_plugin=$temporary/production-config/herdr/plugins/.tmp-install-246-802/checkout/plugins/herdr
 production_home=$temporary/production-home
 production_state_home=$temporary/production-state-home
 production_bin=$temporary/production-bin
@@ -160,7 +245,7 @@ case "$(uname -s):$(uname -m)" in
 esac
 bash "$repository_root/scripts/package-release.sh" --target "$production_target" \
     --binary "$production_binary" --output-dir "$production_output"
-production_stem=$production_output/herdr-a2a-0.1.5-$production_suffix
+production_stem=$production_output/herdr-a2a-0.1.6-$production_suffix
 production_asset=$production_stem.tar.gz
 production_asset_sha=$production_asset.sha256
 production_bootstrap_sha=$production_stem.sha256
