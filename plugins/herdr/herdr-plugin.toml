@@ -1,6 +1,6 @@
 id = "herdr.a2a"
 name = "Herdr A2A Broker"
-version = "0.1.5"
+version = "0.1.6"
 min_herdr_version = "0.8.0"
 description = "Zero-config workspace A2A for managed Pi agents in Herdr."
 platforms = ["macos", "linux"]

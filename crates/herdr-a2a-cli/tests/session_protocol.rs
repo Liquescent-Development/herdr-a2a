@@ -130,7 +130,7 @@ fn manifest_contract_declares_hidden_workspace_broker_lifecycle() {
 
     assert_eq!(manifest.id, "herdr.a2a");
     assert_eq!(manifest.name, "Herdr A2A Broker");
-    assert_eq!(manifest.version, "0.1.5");
+    assert_eq!(manifest.version, "0.1.6");
     assert_eq!(manifest.min_herdr_version, "0.8.0");
     assert!(!manifest.description.trim().is_empty());
     assert_eq!(manifest.platforms, ["macos", "linux"]);

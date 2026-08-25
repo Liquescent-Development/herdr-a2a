@@ -245,7 +245,7 @@ case "$(uname -s):$(uname -m)" in
 esac
 bash "$repository_root/scripts/package-release.sh" --target "$production_target" \
     --binary "$production_binary" --output-dir "$production_output"
-production_stem=$production_output/herdr-a2a-0.1.5-$production_suffix
+production_stem=$production_output/herdr-a2a-0.1.6-$production_suffix
 production_asset=$production_stem.tar.gz
 production_asset_sha=$production_asset.sha256
 production_bootstrap_sha=$production_stem.sha256
