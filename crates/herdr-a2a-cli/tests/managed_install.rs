@@ -1775,6 +1775,21 @@ fn repair_adopts_the_exact_github_checkout_relocation_once() {
         .join("config/herdr/plugins/github/herdr.a2a-fixture/plugins/herdr");
     fs::create_dir_all(relocated_root.parent().unwrap()).unwrap();
     fs::rename(&prior_root, &relocated_root).unwrap();
+    let config_parent = fixture.base.join("config");
+    fs::set_permissions(&config_parent, fs::Permissions::from_mode(0o755)).unwrap();
+    for directory in [
+        fixture.base.join("config/herdr"),
+        fixture.base.join("config/herdr/plugins"),
+        fixture.base.join("config/herdr/plugins/github"),
+        fixture
+            .base
+            .join("config/herdr/plugins/github/herdr.a2a-fixture"),
+        fixture
+            .base
+            .join("config/herdr/plugins/github/herdr.a2a-fixture/plugins"),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o775)).unwrap();
+    }
 
     let output = fixture
         .command()
@@ -1803,6 +1818,18 @@ fn repair_adopts_the_exact_github_checkout_relocation_once() {
             .unwrap()
             .starts_with(prior_root.to_str().unwrap())
     }));
+    assert_eq!(
+        fs::metadata(fixture.base.join("config/herdr/plugins/github"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(&relocated_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 
     let repeated = fixture
         .command()
@@ -5628,7 +5655,7 @@ fn event_repair_acts_only_for_pi_and_rejects_unbounded_json() {
         .command()
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
-            r#"{"pane":{"agent_kind":"claude-code"}}"#,
+            r#"{"type":"pane.agent_detected","data":{"agent":{"pane_id":"w1:p2","agent":"claude-code"}}}"#,
         )
         .args(["managed", "repair", "--event"])
         .output()
@@ -5638,12 +5665,25 @@ fn event_repair_acts_only_for_pi_and_rejects_unbounded_json() {
 
     let pi = fixture
         .command()
-        .env("HERDR_PLUGIN_EVENT_JSON", r#"{"pane":{"agent_kind":"pi"}}"#)
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"type":"pane.agent_detected","data":{"agent":{"pane_id":"w1:p2","agent":"pi"}}}"#,
+        )
         .args(["managed", "repair", "--event"])
         .output()
         .unwrap();
     assert_success(&pi);
     assert!(String::from_utf8_lossy(&pi.stdout).contains("next Pi launch"));
+    assert_eq!(fixture.packages(), [fixture.package_source()]);
+
+    fixture.set_packages(vec![]);
+    let legacy_pi = fixture
+        .command()
+        .env("HERDR_PLUGIN_EVENT_JSON", r#"{"pane":{"agent_kind":"pi"}}"#)
+        .args(["managed", "repair", "--event"])
+        .output()
+        .unwrap();
+    assert_success(&legacy_pi);
     assert_eq!(fixture.packages(), [fixture.package_source()]);
 
     let oversized = fixture

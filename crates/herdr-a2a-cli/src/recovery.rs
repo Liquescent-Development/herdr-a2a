@@ -682,19 +682,29 @@ async fn decode_registration(
         bytes.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        let message = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| format!("broker returned HTTP {status}"));
-        return Err(RecoveryError::RegistrationRejected(message));
+        return Err(decode_registration_error(status, &bytes));
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| RecoveryError::RegistrationRejected(error.to_string()))
+}
+
+fn decode_registration_error(status: reqwest::StatusCode, encoded: &[u8]) -> RecoveryError {
+    let parsed = serde_json::from_slice::<Value>(encoded).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+        .and_then(Value::as_str);
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("broker returned HTTP {status}"));
+    if code == Some("verification_failed") {
+        RecoveryError::Unavailable(message)
+    } else {
+        RecoveryError::RegistrationRejected(message)
+    }
 }
 
 fn authenticated_http(
@@ -967,6 +977,64 @@ mod tests {
         fn jitter_percent(&self) -> u8 {
             0
         }
+    }
+
+    #[test]
+    fn registration_verification_pending_is_transient() {
+        let error = super::decode_registration_error(
+            reqwest::StatusCode::FORBIDDEN,
+            br#"{"error":{"code":"verification_failed","message":"Herdr could not verify this pane"}}"#,
+        );
+
+        assert!(matches!(
+            error,
+            RecoveryError::Unavailable(message)
+                if message == "Herdr could not verify this pane"
+        ));
+    }
+
+    #[test]
+    fn registration_rejections_other_than_verification_pending_remain_final() {
+        for encoded in [
+            br#"{"error":{"code":"agent_identity_changed","message":"Herdr could not verify this pane"}}"#.as_slice(),
+            br#"{"error":{"code":"unknown","message":"rejected"}}"#.as_slice(),
+            b"not-json".as_slice(),
+        ] {
+            assert!(matches!(
+                super::decode_registration_error(reqwest::StatusCode::FORBIDDEN, encoded),
+                RecoveryError::RegistrationRejected(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_connection_retries_transient_registration_failure() {
+        let executable = identity().executable;
+        let expected = connection(FIRST_INSTANCE, &executable);
+        let backend = Arc::new(ScriptedBackend::new(
+            vec![expected.descriptor.clone(), expected.descriptor.clone()],
+            vec![expected],
+        ));
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .registrations
+            .push_front(Err(RecoveryError::Unavailable(
+                "verification pending".to_owned(),
+            )));
+
+        ConnectionManager::connect(
+            identity(),
+            backend.clone(),
+            Arc::new(ReadyLauncher::new()),
+            CancellationSignal::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(backend.counts(), (2, 2));
+        assert_eq!(backend.sleeps(), [Duration::from_millis(50)]);
     }
 
     fn identity() -> SessionIdentity {
