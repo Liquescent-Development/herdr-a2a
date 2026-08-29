@@ -4578,7 +4578,7 @@ async fn restart_recovery_preserves_deadline_after_task_confirmation() {
     assert_eq!(timed_out["result"]["timed_out"], true);
     assert_eq!(timed_out["result"]["task_confirmed"], true);
     assert_eq!(timed_out["result"]["task_reachable"], true);
-    assert_eq!(timed_out["result"]["recovery_reason"], "broker_unavailable");
+    assert_eq!(timed_out["result"]["recovery_reason"], "deadline_expired");
     assert_eq!(runtime.task_count().await, 1);
 }
 

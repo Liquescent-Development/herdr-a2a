@@ -16,9 +16,9 @@ use std::{
 };
 
 use rustix::fs::{FlockOperation, flock};
-use rustix::process::{
-    Pid, Signal, kill_process, kill_process_group, setpgid, test_kill_process_group,
-};
+#[cfg(not(target_os = "linux"))]
+use rustix::process::test_kill_process_group;
+use rustix::process::{Pid, Signal, kill_process, kill_process_group, setpgid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
@@ -4054,6 +4054,22 @@ fn wait_for_process_group_retirement(group_pid: u32, deadline: Instant) -> bool 
     !process_group_is_live(group_pid)
 }
 
+#[cfg(target_os = "linux")]
+fn process_group_is_live(group_pid: u32) -> bool {
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                .and_then(linux_process_state_and_group)
+                .is_some_and(|(state, process_group)| state != b'Z' && process_group == group_pid)
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
 fn process_group_is_live(group_pid: u32) -> bool {
     i32::try_from(group_pid)
         .ok()
@@ -4321,6 +4337,25 @@ fn stale_starting_reservations_reconcile_only_with_exact_process_proof() {
     fixture.assert_no_starting_or_registered_entry();
 }
 
+#[cfg(target_os = "linux")]
+fn linux_process_state_and_group(pid: u32) -> Option<(u8, u32)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let state = *fields.first()?.as_bytes().first()?;
+    let process_group = fields.get(2)?.parse().ok()?;
+    Some((state, process_group))
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_live(pid: u32) -> bool {
+    linux_process_state_and_group(pid).is_some_and(|(state, _)| state != b'Z')
+}
+
+#[cfg(not(target_os = "linux"))]
 fn process_is_live(pid: u32) -> bool {
     Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
@@ -5945,23 +5980,28 @@ fn persisted_paths_reject_line_breaks_and_non_utf8() {
     // stable pointer and a Pi source that cannot be compared exactly.
     let fixture = ManagedFixture::new();
     let bundle = fixture.bundle("1.0.0", "adapter one\n");
-    let newline_home = fixture.base.join("home\nline");
-    fs::create_dir(&newline_home).unwrap();
+    let persisted_root_variable = if cfg!(target_os = "macos") {
+        "HOME"
+    } else {
+        "XDG_DATA_HOME"
+    };
+    let newline_root = fixture.base.join("home\nline");
+    fs::create_dir(&newline_root).unwrap();
     let output = fixture
         .command()
-        .env("HOME", &newline_home)
+        .env(persisted_root_variable, &newline_root)
         .args(["managed", "install", "--bundle"])
         .arg(&bundle)
         .output()
         .unwrap();
     assert_failure_code(&output, "unsafe_install_path");
 
-    let non_utf8_home = fixture
+    let non_utf8_root = fixture
         .base
         .join(std::ffi::OsString::from_vec(vec![b'h', b'o', 0xff]));
     let output = fixture
         .command()
-        .env("HOME", &non_utf8_home)
+        .env(persisted_root_variable, &non_utf8_root)
         .args(["managed", "install", "--bundle"])
         .arg(bundle)
         .output()
