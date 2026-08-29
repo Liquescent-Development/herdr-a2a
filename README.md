@@ -171,10 +171,10 @@ coordinator remains authoritative for managed workspace startup.
 Release tags must be trusted SSH-signed tags named exactly `v<manifest-version>`. CI builds native
 archives for:
 
-- `aarch64-apple-darwin` → `herdr-a2a-0.1.6-macos-arm64.tar.gz`
-- `x86_64-apple-darwin` → `herdr-a2a-0.1.6-macos-x86_64.tar.gz`
-- `aarch64-unknown-linux-gnu` → `herdr-a2a-0.1.6-linux-arm64.tar.gz`
-- `x86_64-unknown-linux-gnu` → `herdr-a2a-0.1.6-linux-x86_64.tar.gz`
+- `aarch64-apple-darwin` → `herdr-a2a-0.1.7-macos-arm64.tar.gz`
+- `x86_64-apple-darwin` → `herdr-a2a-0.1.7-macos-x86_64.tar.gz`
+- `aarch64-unknown-linux-gnu` → `herdr-a2a-0.1.7-linux-arm64.tar.gz`
+- `x86_64-unknown-linux-gnu` → `herdr-a2a-0.1.7-linux-x86_64.tar.gz`
 
 Each target also publishes the same-stem bootstrap binary and SHA-256 files. Archives contain only
 the stable binary, Pi package files, ownership metadata template, dispatch script, and source-only
