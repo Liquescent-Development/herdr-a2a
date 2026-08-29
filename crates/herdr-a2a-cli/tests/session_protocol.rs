@@ -130,7 +130,7 @@ fn manifest_contract_declares_hidden_workspace_broker_lifecycle() {
 
     assert_eq!(manifest.id, "herdr.a2a");
     assert_eq!(manifest.name, "Herdr A2A Broker");
-    assert_eq!(manifest.version, "0.1.6");
+    assert_eq!(manifest.version, "0.1.7");
     assert_eq!(manifest.min_herdr_version, "0.8.0");
     assert!(!manifest.description.trim().is_empty());
     assert_eq!(manifest.platforms, ["macos", "linux"]);
@@ -4578,7 +4578,7 @@ async fn restart_recovery_preserves_deadline_after_task_confirmation() {
     assert_eq!(timed_out["result"]["timed_out"], true);
     assert_eq!(timed_out["result"]["task_confirmed"], true);
     assert_eq!(timed_out["result"]["task_reachable"], true);
-    assert_eq!(timed_out["result"]["recovery_reason"], "broker_unavailable");
+    assert_eq!(timed_out["result"]["recovery_reason"], "deadline_expired");
     assert_eq!(runtime.task_count().await, 1);
 }
 

@@ -22,6 +22,7 @@ jobs:
           printf '%s\n' \
             'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09' \
             'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID8mhKoSvoSEzgN45bawiPh6UWKe+I5PRWkrhrswRwTL' \
+            'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEUqxXcl+kDWcF/jHgAXPa2BbaXkdM0Ze/WvX23mUwMf' \
             > "$RUNNER_TEMP/herdr-a2a-allowed-signers"
           bash scripts/verify-release-tag.sh \
             --tag "$GITHUB_REF_NAME" \
@@ -138,6 +139,7 @@ jobs:
           printf '%s\n' \
             'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHyTKmfAwcJcdfKXmj2h3mwfgPaelE6gSMrquAcPmW09' \
             'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID8mhKoSvoSEzgN45bawiPh6UWKe+I5PRWkrhrswRwTL' \
+            'richard@liquescent.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEUqxXcl+kDWcF/jHgAXPa2BbaXkdM0Ze/WvX23mUwMf' \
             > "$RUNNER_TEMP/herdr-a2a-allowed-signers"
           bash scripts/verify-release-tag.sh \
             --tag "$GITHUB_REF_NAME" \

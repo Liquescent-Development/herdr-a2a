@@ -1065,7 +1065,7 @@ pub(crate) async fn stop_starting_process(
     )?;
     let coordinator_absent = observed_process_proof(entry.coordinator_pid)?.is_none();
     if coordinator_absent {
-        require_unheld_starting_coordinator_lock(&paths, entry)?;
+        wait_for_unheld_starting_coordinator_lock(&paths, entry, deadline).await?;
     }
     if let Some(broker) = &entry.broker {
         validate_reserved_process(
@@ -1098,7 +1098,7 @@ pub(crate) async fn stop_starting_process(
             )?;
         }
     }
-    require_unheld_starting_coordinator_lock(&paths, entry)?;
+    wait_for_unheld_starting_coordinator_lock(&paths, entry, deadline).await?;
     ensure_stop_deadline(deadline)?;
     Ok(())
 }
@@ -1131,41 +1131,48 @@ fn starting_descriptor(
     }
 }
 
-fn require_unheld_starting_coordinator_lock(
+async fn wait_for_unheld_starting_coordinator_lock(
     paths: &RuntimePaths,
     entry: &managed::ManagedStartingProcessEntry,
+    deadline: tokio::time::Instant,
 ) -> Result<(), DynError> {
-    let mut file = match CoordinatorLock::open(paths, false) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {}
-        Err(rustix::io::Errno::WOULDBLOCK) => {
+    loop {
+        let mut file = match CoordinatorLock::open(paths, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                return match read_record(&mut file) {
+                    Ok(record)
+                        if record.scope_key == entry.scope_key
+                            && record.pid == entry.coordinator_pid
+                            && record.start_identity == entry.coordinator_start =>
+                    {
+                        Ok(())
+                    }
+                    Ok(_) => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "starting coordinator lock identity changed",
+                    )
+                    .into()),
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(()),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => {}
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "starting coordinator lock remains held",
             )
             .into());
         }
-        Err(error) => return Err(io::Error::from(error).into()),
-    }
-    match read_record(&mut file) {
-        Ok(record)
-            if record.scope_key == entry.scope_key
-                && record.pid == entry.coordinator_pid
-                && record.start_identity == entry.coordinator_start =>
-        {
-            Ok(())
-        }
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "starting coordinator lock identity changed",
-        )
-        .into()),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(()),
-        Err(error) => Err(error.into()),
+        tokio::time::sleep(remaining.min(DESCRIPTOR_RECHECK)).await;
     }
 }
 

@@ -171,26 +171,30 @@ coordinator remains authoritative for managed workspace startup.
 Release tags must be trusted SSH-signed tags named exactly `v<manifest-version>`. CI builds native
 archives for:
 
-- `aarch64-apple-darwin` → `herdr-a2a-0.1.6-macos-arm64.tar.gz`
-- `x86_64-apple-darwin` → `herdr-a2a-0.1.6-macos-x86_64.tar.gz`
-- `aarch64-unknown-linux-gnu` → `herdr-a2a-0.1.6-linux-arm64.tar.gz`
-- `x86_64-unknown-linux-gnu` → `herdr-a2a-0.1.6-linux-x86_64.tar.gz`
+- `aarch64-apple-darwin` → `herdr-a2a-0.1.7-macos-arm64.tar.gz`
+- `x86_64-apple-darwin` → `herdr-a2a-0.1.7-macos-x86_64.tar.gz`
+- `aarch64-unknown-linux-gnu` → `herdr-a2a-0.1.7-linux-arm64.tar.gz`
+- `x86_64-unknown-linux-gnu` → `herdr-a2a-0.1.7-linux-x86_64.tar.gz`
 
 Each target also publishes the same-stem bootstrap binary and SHA-256 files. Archives contain only
 the stable binary, Pi package files, ownership metadata template, dispatch script, and source-only
 rescue script, with normalized owners, modes, timestamps, ordering, and gzip metadata.
 
-The repository acceptance gate is:
+The repository acceptance gate is below. The Rust test runner uses a private dedicated target
+directory and fixes the umask, test-thread count, and debug-info level required by the
+security-sensitive fixtures. Set `HERDR_A2A_TEST_TARGET_DIR` to choose a different private target
+directory.
 
 ```sh
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo fmt --all -- --check
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
-CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo test --workspace --all-features
+bash scripts/test-workspace.sh
 npm --prefix integrations/pi test
 npm --prefix integrations/pi run typecheck
 bash -n plugins/herdr/scripts/install.sh
 bash -n plugins/herdr/scripts/dispatch.sh
 bash -n plugins/herdr/scripts/uninstall.sh
+bash scripts/test-workspace-self-test.sh
 bash scripts/managed-install-self-test.sh
 bash scripts/uninstall-self-test.sh
 bash scripts/package-release.sh --self-test

@@ -4988,7 +4988,14 @@ fn reconcile_relocated_managed_plugin_root(
             ));
         }
     }
-    harden_owned_private_directory(&current_root, "relocated plugin root")?;
+    let boundary = managed_relocated_plugin_config_boundary(&current_root)?;
+    validate_or_harden_directory_chain(
+        &current_root,
+        DirectoryPolicy::ManagedOwned {
+            boundary: &boundary,
+            final_mode: Some(0o700),
+        },
+    )?;
 
     let prior_helper = record.plugin_root.join("libexec/herdr-a2a-dispatch");
     let prior_pointer = record.plugin_root.join("stable-bin-path");
@@ -5351,6 +5358,32 @@ fn managed_plugin_config_boundary(path: &Path) -> ManagedResult<PathBuf> {
         return Err(ManagedError::new(
             "unsafe_install_path",
             "managed plugin root does not match the Herdr temporary checkout layout",
+        ));
+    }
+    Ok(config_root.unwrap().to_path_buf())
+}
+
+fn managed_relocated_plugin_config_boundary(path: &Path) -> ManagedResult<PathBuf> {
+    let plugin_name = path.file_name();
+    let repository_plugins = path.parent();
+    let repository = repository_plugins.and_then(Path::parent);
+    let github = repository.and_then(Path::parent);
+    let managed_plugins = github.and_then(Path::parent);
+    let config_root = managed_plugins.and_then(Path::parent);
+    let repository_name = repository.and_then(Path::file_name).and_then(OsStr::to_str);
+    if plugin_name != Some(OsStr::new("herdr"))
+        || repository_plugins.and_then(Path::file_name) != Some(OsStr::new("plugins"))
+        || github.and_then(Path::file_name) != Some(OsStr::new("github"))
+        || managed_plugins.and_then(Path::file_name) != Some(OsStr::new("plugins"))
+        || config_root.and_then(Path::file_name) != Some(OsStr::new("herdr"))
+        || !repository_name.is_some_and(|name| {
+            name.strip_prefix("herdr.a2a-")
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+    {
+        return Err(ManagedError::new(
+            "unsafe_install_path",
+            "relocated plugin root does not match the Herdr GitHub checkout layout",
         ));
     }
     Ok(config_root.unwrap().to_path_buf())
@@ -6833,7 +6866,10 @@ fn event_is_pi() -> ManagedResult<bool> {
     }
     let value: Value = serde_json::from_str(&encoded)
         .map_err(|error| ManagedError::new("invalid_plugin_event", error.to_string()))?;
-    let pane = value.get("pane").unwrap_or(&value);
+    let pane = value
+        .pointer("/data/agent")
+        .or_else(|| value.get("pane"))
+        .unwrap_or(&value);
     let kind = ["agent_kind", "harness", "kind", "agent"]
         .into_iter()
         .find_map(|field| pane.get(field).and_then(Value::as_str));
