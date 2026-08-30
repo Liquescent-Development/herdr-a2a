@@ -6870,10 +6870,11 @@ fn event_is_pi() -> ManagedResult<bool> {
     }
     let value: Value = serde_json::from_str(&encoded)
         .map_err(|error| ManagedError::new("invalid_plugin_event", error.to_string()))?;
-    let pane = value
-        .pointer("/data/agent")
-        .or_else(|| value.get("pane"))
-        .unwrap_or(&value);
+    let event_agent = value.pointer("/data/agent");
+    if let Some(kind) = event_agent.and_then(Value::as_str) {
+        return Ok(kind == "pi");
+    }
+    let pane = event_agent.or_else(|| value.get("pane")).unwrap_or(&value);
     let kind = ["agent_kind", "harness", "kind", "agent"]
         .into_iter()
         .find_map(|field| pane.get(field).and_then(Value::as_str));

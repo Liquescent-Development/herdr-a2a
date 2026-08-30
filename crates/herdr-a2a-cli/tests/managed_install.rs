@@ -1866,6 +1866,49 @@ fn repair_adopts_the_exact_github_checkout_relocation_once() {
 }
 
 #[test]
+fn real_herdr_pi_event_adopts_the_relocated_managed_root() {
+    // Break caught: Herdr serializes pane.agent_detected with data.agent as a string. Treating
+    // that value as an object made event repair report success without adopting the final root.
+    let fixture = ManagedFixture::new();
+    let transactional_root = fixture.transactional_plugin_root("event-123");
+    let bundle = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install_from_plugin_root(&bundle, &transactional_root));
+    let relocated_root = fixture
+        .base
+        .join("config/herdr/plugins/github/herdr.a2a-fixture/plugins/herdr");
+    fs::create_dir_all(relocated_root.parent().unwrap()).unwrap();
+    fs::rename(&transactional_root, &relocated_root).unwrap();
+
+    let output = fixture
+        .command()
+        .env("HERDR_A2A_PLUGIN_ROOT", &relocated_root)
+        .env("HERDR_A2A_TEST_HERDR_PLUGIN_ROOT", &relocated_root)
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_agent_detected","data":{"pane_id":"w1:p1","workspace_id":"w1","agent":"pi","released":false}}"#,
+        )
+        .args(["managed", "repair", "--event"])
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let record = fixture.record();
+    assert_eq!(record["plugin_root"], relocated_root.to_str().unwrap());
+    assert!(
+        record["owned_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| {
+                !entry["path"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(transactional_root.to_str().unwrap())
+            })
+    );
+}
+
+#[test]
 fn managed_remove_preserves_unowned_pi_configuration_and_durable_data() {
     // Break caught: broad Pi or stable-root cleanup removes a user package or retained workspace data.
     let fixture = ManagedFixture::new();
@@ -5746,7 +5789,7 @@ fn event_repair_acts_only_for_pi_and_rejects_unbounded_json() {
         .command()
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
-            r#"{"type":"pane.agent_detected","data":{"agent":{"pane_id":"w1:p2","agent":"claude-code"}}}"#,
+            r#"{"event":"pane_agent_detected","data":{"pane_id":"w1:p2","workspace_id":"w1","agent":"claude","released":false}}"#,
         )
         .args(["managed", "repair", "--event"])
         .output()
@@ -5754,11 +5797,23 @@ fn event_repair_acts_only_for_pi_and_rejects_unbounded_json() {
     assert_success(&non_pi);
     assert_eq!(fixture.pi_log(), initial_log);
 
+    let malformed = fixture
+        .command()
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_agent_detected","data":{"agent":["pi"]}}"#,
+        )
+        .args(["managed", "repair", "--event"])
+        .output()
+        .unwrap();
+    assert_success(&malformed);
+    assert_eq!(fixture.pi_log(), initial_log);
+
     let pi = fixture
         .command()
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
-            r#"{"type":"pane.agent_detected","data":{"agent":{"pane_id":"w1:p2","agent":"pi"}}}"#,
+            r#"{"event":"pane_agent_detected","data":{"pane_id":"w1:p2","workspace_id":"w1","agent":"pi","released":false}}"#,
         )
         .args(["managed", "repair", "--event"])
         .output()
