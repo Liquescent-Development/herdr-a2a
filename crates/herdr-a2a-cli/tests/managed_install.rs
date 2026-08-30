@@ -831,6 +831,30 @@ esac
             .unwrap()
     }
 
+    fn transactional_plugin_root(&self, token: &str) -> PathBuf {
+        let root = self.base.join(format!(
+            "config/herdr/plugins/.tmp-install-{token}/checkout/plugins/herdr"
+        ));
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(root.join("scripts"), fs::Permissions::from_mode(0o700)).unwrap();
+        for relative in ["herdr-plugin.toml", "scripts/uninstall.sh"] {
+            fs::copy(self.plugin_root.join(relative), root.join(relative)).unwrap();
+            fs::set_permissions(root.join(relative), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        root
+    }
+
+    fn install_from_plugin_root(&self, bundle: &Path, plugin_root: &Path) -> Output {
+        self.command()
+            .env("HERDR_A2A_PLUGIN_ROOT", plugin_root)
+            .env("HERDR_A2A_TEST_HERDR_PLUGIN_ROOT", plugin_root)
+            .args(["managed", "install", "--bundle"])
+            .arg(bundle)
+            .output()
+            .unwrap()
+    }
+
     fn run_lifecycle_operation_with_watchdog(
         &self,
         operation: &str,
@@ -1876,9 +1900,9 @@ fn managed_remove_preserves_unowned_pi_configuration_and_durable_data() {
 }
 
 #[test]
-fn reinstall_after_non_purge_removal_recovers_retained_durable_data() {
-    // Break caught: reinstall treats the intentionally absent assets in a Removed record as an
-    // interrupted swap, so retained workspace data can never be adopted by a new managed install.
+fn reinstall_from_new_transaction_root_recovers_retained_durable_data() {
+    // Break caught: Herdr runs every install from a new transactional checkout, but reinstall
+    // rejected that new root before validating the prior Removed record and retained workspace.
     let fixture = ManagedFixture::new();
     let first = fixture.bundle("1.0.0", "adapter one\n");
     assert_success(&fixture.install(&first));
@@ -1896,10 +1920,16 @@ fn reinstall_after_non_purge_removal_recovers_retained_durable_data() {
     assert_success(&fixture.remove_after_exact_plugin_absence(false));
     assert_eq!(fixture.record()["state"], "Removed");
 
+    let reinstall_root = fixture.transactional_plugin_root("123-456");
     let second = fixture.bundle("2.0.0", "adapter two\n");
-    assert_success(&fixture.install(&second));
+    let output = fixture.install_from_plugin_root(&second, &reinstall_root);
+    assert_success(&output);
 
     assert_eq!(fixture.record()["state"], "Ready");
+    assert_eq!(
+        fixture.record()["plugin_root"],
+        reinstall_root.to_str().unwrap()
+    );
     assert_eq!(fs::read_to_string(retained).unwrap(), "retained\n");
     assert_eq!(fixture.packages(), [fixture.package_source()]);
 }
@@ -1919,12 +1949,38 @@ fn reinstall_from_removed_rejects_unowned_rescue_residue() {
     fs::write(&residue, "preserve\n").unwrap();
     fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).unwrap();
 
+    let reinstall_root = fixture.transactional_plugin_root("residue-789");
     let second = fixture.bundle("2.0.0", "adapter two\n");
-    let output = fixture.install(&second);
+    let output = fixture.install_from_plugin_root(&second, &reinstall_root);
 
     assert_failure_code(&output, "ownership_conflict");
     assert_eq!(fixture.record()["state"], "Removed");
     assert_eq!(fs::read_to_string(&residue).unwrap(), "preserve\n");
+}
+
+#[test]
+fn removed_managed_install_rejects_a_new_linked_development_root() {
+    // Break caught: checking only the prior install kind let a new linked checkout claim a Removed
+    // managed record merely by changing HERDR_A2A_PLUGIN_ROOT.
+    let fixture = ManagedFixture::new();
+    let first = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install(&first));
+    assert_success(&fixture.remove_after_exact_plugin_absence(false));
+
+    let linked_root = fixture.transactional_plugin_root("linked-123");
+    let second = fixture.bundle("2.0.0", "adapter two\n");
+    let output = fixture
+        .command()
+        .env("HERDR_A2A_PLUGIN_ROOT", &linked_root)
+        .env("HERDR_A2A_TEST_HERDR_PLUGIN_ROOT", &linked_root)
+        .env("HERDR_A2A_INSTALL_KIND", "linked-dev")
+        .args(["managed", "install", "--bundle"])
+        .arg(&second)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "ownership_conflict");
+    assert_eq!(fixture.record()["state"], "Removed");
 }
 
 #[test]

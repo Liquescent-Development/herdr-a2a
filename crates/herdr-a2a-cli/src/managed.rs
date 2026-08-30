@@ -1056,6 +1056,16 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
     let mut pi = detect_pi()?;
     validate_install_compatibility(&plugin_root, &bundle_binary, &bundle_package, pi.as_ref())
         .await?;
+    let install_kind = match env::var("HERDR_A2A_INSTALL_KIND") {
+        Ok(value) if value == "linked-dev" || value == "managed" => value,
+        Ok(_) => {
+            return Err(ManagedError::new(
+                "invalid_install_kind",
+                "HERDR_A2A_INSTALL_KIND must be managed or linked-dev",
+            ));
+        }
+        Err(_) => "managed".to_owned(),
+    };
 
     let stable_root = stable_root()?;
     create_private_directory(&stable_root)?;
@@ -1077,7 +1087,11 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
     harden_owned_private_directory(&plugin_root, "plugin root")?;
     let mut prior = read_record_optional(&stable_root)?;
     if let Some(record) = prior.as_mut() {
-        if record.plugin_root != plugin_root {
+        if record.plugin_root != plugin_root
+            && !(record.state == InstallState::Removed
+                && record.install_kind == "managed"
+                && install_kind == "managed")
+        {
             return Err(ManagedError::new(
                 "ownership_conflict",
                 "the existing ownership record belongs to a different plugin root",
@@ -1133,16 +1147,6 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
         }
     }
     let _install_lock = install_lock;
-    let install_kind = match env::var("HERDR_A2A_INSTALL_KIND") {
-        Ok(value) if value == "linked-dev" || value == "managed" => value,
-        Ok(_) => {
-            return Err(ManagedError::new(
-                "invalid_install_kind",
-                "HERDR_A2A_INSTALL_KIND must be managed or linked-dev",
-            ));
-        }
-        Err(_) => "managed".to_owned(),
-    };
     let (generation_directory, generation_files) = generation_plan(
         &stable_root,
         &bundle_package,
