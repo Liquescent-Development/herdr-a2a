@@ -1,6 +1,6 @@
 {
   "name": "@herdr/a2a-pi",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Managed zero-config workspace A2A for Pi agents in Herdr.",
   "private": true,
   "type": "module",
