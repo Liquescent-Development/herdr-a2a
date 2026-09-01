@@ -73,7 +73,7 @@ Expected: PASS with no journal residue and no unrelated state mutation.
 
 Expected: all 133 tests pass under the canonical test environment.
 
-- [ ] **Step 5: Commit the fix and its design records**
+- [x] **Step 5: Commit the fix and its design records**
 
 Commit message: `fix: recreate purged plugin state on reinstall`
 
@@ -85,7 +85,7 @@ Commit message: `fix: recreate purged plugin state on reinstall`
 **Interfaces:**
 - Produces: trusted signed `v0.1.10` release and verified installation
 
-- [ ] **Step 1: Update synchronized versions to 0.1.10 and commit separately**
+- [x] **Step 1: Update synchronized versions to 0.1.10 and commit separately**
 - [ ] **Step 2: Run canonical Rust, Pi, format, Clippy, shell, packaging, signing, smoke, and npm-pack gates**
 - [ ] **Step 3: Request code review, merge the reviewed branch, and sign/push `v0.1.10` at the merge commit**
 - [ ] **Step 4: Verify all published assets and Linux checksums/version**
