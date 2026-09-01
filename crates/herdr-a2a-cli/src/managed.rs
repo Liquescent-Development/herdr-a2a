@@ -1110,6 +1110,7 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             ));
         } else if record.state == InstallState::Removed {
             validate_removed_record_for_reinstall(record, &stable_root)?;
+            prepare_removed_plugin_state_root_for_reinstall(record, &install_kind)?;
         } else {
             validate_record(record, &stable_root)?;
             validate_pi_entry_if_present(record)?;
@@ -5191,6 +5192,16 @@ fn required_plugin_root() -> ManagedResult<PathBuf> {
 }
 
 fn required_plugin_state_root(install_kind: &str) -> ManagedResult<PathBuf> {
+    let root = required_plugin_state_root_path()?;
+    if install_kind == "managed" {
+        prepare_managed_plugin_state_root(&root)?;
+    } else {
+        harden_owned_private_directory(&root, "plugin-state directory")?;
+    }
+    Ok(root)
+}
+
+fn required_plugin_state_root_path() -> ManagedResult<PathBuf> {
     let root = env::var_os("HERDR_PLUGIN_STATE_DIR")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -5199,13 +5210,24 @@ fn required_plugin_state_root(install_kind: &str) -> ManagedResult<PathBuf> {
                 "HERDR_PLUGIN_STATE_DIR is required during install",
             )
         })?;
-    let root = require_absolute_normal(Path::new(&root), "HERDR_PLUGIN_STATE_DIR")?;
-    if install_kind == "managed" {
-        prepare_managed_plugin_state_root(&root)?;
-    } else {
-        harden_owned_private_directory(&root, "plugin-state directory")?;
+    require_absolute_normal(Path::new(&root), "HERDR_PLUGIN_STATE_DIR")
+}
+
+fn prepare_removed_plugin_state_root_for_reinstall(
+    record: &OwnershipRecord,
+    install_kind: &str,
+) -> ManagedResult<()> {
+    if !record.purge_authority || record.install_kind != "managed" || install_kind != "managed" {
+        return Ok(());
     }
-    Ok(root)
+    let configured_root = required_plugin_state_root_path()?;
+    if configured_root != record.plugin_state_root {
+        return Err(ManagedError::new(
+            "ownership_conflict",
+            "HERDR_PLUGIN_STATE_DIR does not match the authenticated ownership record",
+        ));
+    }
+    prepare_managed_plugin_state_root(&configured_root)
 }
 
 fn prepare_managed_plugin_state_root(path: &Path) -> ManagedResult<()> {
