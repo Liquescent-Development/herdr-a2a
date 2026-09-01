@@ -1978,6 +1978,91 @@ fn reinstall_from_new_transaction_root_recovers_retained_durable_data() {
 }
 
 #[test]
+fn reinstall_from_new_transaction_root_recreates_purged_plugin_state() {
+    // Break caught: purge deletes the authenticated plugin-state root, but reinstall tried to
+    // validate that absent directory only after publishing the new generation and plugin assets.
+    let fixture = ManagedFixture::new();
+    let first = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install(&first));
+    let reinstall_root = fixture.transactional_plugin_root("purged-123");
+
+    assert_success(&fixture.remove_after_exact_plugin_absence(true));
+    assert_eq!(fixture.record()["state"], "Removed");
+    assert!(!fixture.plugin_state.exists());
+    fs::remove_dir_all(&fixture.plugin_root).unwrap();
+
+    let second = fixture.bundle("2.0.0", "adapter two\n");
+    let output = fixture.install_from_plugin_root(&second, &reinstall_root);
+    assert_success(&output);
+
+    let record = fixture.record();
+    assert_eq!(record["state"], "Ready");
+    assert_eq!(record["plugin_root"], reinstall_root.to_str().unwrap());
+    assert_eq!(
+        record["plugin_state_root"],
+        fixture.plugin_state.to_str().unwrap()
+    );
+    assert!(fixture.plugin_state.is_dir());
+    assert_eq!(
+        fs::symlink_metadata(&fixture.plugin_state)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(
+        !fixture
+            .stable_root()
+            .join("install-transaction.json")
+            .exists()
+    );
+}
+
+#[test]
+fn removed_reinstall_rejects_a_changed_plugin_state_root_without_mutation() {
+    // Break caught: a Removed reinstall ignored HERDR_PLUGIN_STATE_DIR and could complete while
+    // retaining purge authority over a different state root than Herdr configured for this run.
+    let fixture = ManagedFixture::new();
+    let first = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install(&first));
+    let retained = fixture.plugin_state.join("retained.txt");
+    fs::write(&retained, "retained\n").unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_success(&fixture.remove_after_exact_plugin_absence(false));
+
+    let record_before = fs::read(fixture.ownership_path()).unwrap();
+    let pi_before = fs::read(fixture.pi_agent_dir.join("settings.json")).unwrap();
+    let reinstall_root = fixture.transactional_plugin_root("changed-state-456");
+    let alternate_state = fixture.base.join("alternate-state/herdr/plugins/herdr.a2a");
+    let second = fixture.bundle("2.0.0", "adapter two\n");
+    let output = fixture
+        .command()
+        .env("HERDR_A2A_PLUGIN_ROOT", &reinstall_root)
+        .env("HERDR_A2A_TEST_HERDR_PLUGIN_ROOT", &reinstall_root)
+        .env("HERDR_PLUGIN_STATE_DIR", &alternate_state)
+        .args(["managed", "install", "--bundle"])
+        .arg(&second)
+        .output()
+        .unwrap();
+
+    assert_failure_code(&output, "ownership_conflict");
+    assert_eq!(fs::read(fixture.ownership_path()).unwrap(), record_before);
+    assert_eq!(
+        fs::read(fixture.pi_agent_dir.join("settings.json")).unwrap(),
+        pi_before
+    );
+    assert_eq!(fs::read_to_string(&retained).unwrap(), "retained\n");
+    assert!(!alternate_state.exists());
+    assert!(
+        !fixture
+            .stable_root()
+            .join("install-transaction.json")
+            .exists()
+    );
+}
+
+#[test]
 fn reinstall_from_removed_rejects_unowned_rescue_residue() {
     // Break caught: Removed-record validation checked only formerly owned paths, so an unrelated
     // rescue entry survived reinstall and made the next managed removal permanently fail closed.
