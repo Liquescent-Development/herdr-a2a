@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { chmod, copyFile, mkdir, mkdtemp, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { fixtureDirectory } from "./owned-scratch.ts";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -196,7 +196,7 @@ test("workspace ensure derives and forwards required native dispatch environment
   assert.equal(typeof managed.ensureWorkspaceBroker, "function");
   if (managed.ensureWorkspaceBroker === undefined) return;
   const fixture = await descriptorFixture();
-  const binDir = await mkdtemp(join(tmpdir(), "herdr-a2a-herdr-bin-"));
+  const binDir = await fixtureDirectory("herdr-a2a-herdr-bin-");
   const herdr = join(binDir, "herdr");
   await writeFile(herdr, "fixture");
   await chmod(herdr, 0o700);
@@ -379,7 +379,7 @@ function managedPluginList(pluginRoot: string): string {
 test("loads only the workspace-scoped descriptor for a shared Herdr socket", async () => {
   // Break caught: Pi derives discovery from only the socket session and either misses scoped
   // descriptors or adopts another workspace's credentials.
-  const base = await mkdtemp(join(tmpdir(), "herdr-a2a-pi-workspace-"));
+  const base = await fixtureDirectory("herdr-a2a-pi-workspace-");
   await chmod(base, 0o700);
   const runtimeRoot = join(base, "herdr-a2a");
   await mkdir(runtimeRoot, { mode: 0o700 });
@@ -804,7 +804,7 @@ test("unexpected stdout termination rejects pending work", async () => {
 
 test("starts the descriptor executable with the Pi session ID after permission checks", async () => {
   // Break caught: PATH lookup or a caller-provided executable bypasses the protected descriptor.
-  const base = await mkdtemp(join(tmpdir(), "herdr-a2a-pi-test-"));
+  const base = await fixtureDirectory("herdr-a2a-pi-test-");
   const runtimeRoot = join(base, "herdr-a2a");
   await mkdir(runtimeRoot, { mode: 0o700 });
   await chmod(runtimeRoot, 0o700);
@@ -871,7 +871,7 @@ test("managed client session derives required native environment from an ordinar
   // Break caught: cold broker startup succeeded, but the first team/tool request launched the
   // native client without HERDR_BIN_PATH or HERDR_PLUGIN_STATE_DIR and failed before registration.
   const fixture = await descriptorFixture();
-  const binDir = await mkdtemp(join(tmpdir(), "herdr-a2a-client-herdr-bin-"));
+  const binDir = await fixtureDirectory("herdr-a2a-client-herdr-bin-");
   const herdr = join(binDir, "herdr");
   await writeFile(herdr, "fixture");
   await chmod(herdr, 0o700);
@@ -930,7 +930,7 @@ interface DescriptorFixture {
 }
 
 async function descriptorFixture(): Promise<DescriptorFixture> {
-  const base = await mkdtemp(join(tmpdir(), "herdr-a2a-pi-descriptor-"));
+  const base = await fixtureDirectory("herdr-a2a-pi-descriptor-");
   await chmod(base, 0o700);
   const runtimeRoot = join(base, "herdr-a2a");
   await mkdir(runtimeRoot, { mode: 0o700 });
@@ -1056,7 +1056,8 @@ test("rejects unsafe parent, root, descriptor, and executable paths before spawn
 
   const nonExecutable = await descriptorFixture();
   const executableCopy = join(nonExecutable.base, "not-owner-executable");
-  await copyFile(process.execPath, executableCopy);
+  // Permission-only rejection before spawn needs no copy of the Node binary.
+  await writeFile(executableCopy, "#!/bin/sh\nexit 99\n");
   await chmod(executableCopy, 0o001);
   nonExecutable.descriptor.executable_path = await realpath(executableCopy);
   await writeDescriptor(nonExecutable);
@@ -1074,7 +1075,7 @@ test("rejects an executable with no mode bits even when effective access is perm
   // Break caught: dropping Rust's explicit 0o111 gate lets an access-only check accept the descriptor.
   const fixture = await descriptorFixture();
   const executableCopy = join(fixture.base, "mode-zero-executable");
-  await copyFile(process.execPath, executableCopy);
+  await writeFile(executableCopy, "#!/bin/sh\nexit 99\n");
   await chmod(executableCopy, 0o000);
   fixture.descriptor.executable_path = await realpath(executableCopy);
   await writeDescriptor(fixture);
