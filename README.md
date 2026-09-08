@@ -183,7 +183,15 @@ rescue script, with normalized owners, modes, timestamps, ordering, and gzip met
 The repository acceptance gate is below. The Rust test runner uses a private dedicated target
 directory and fixes the umask, test-thread count, and debug-info level required by the
 security-sensitive fixtures. Set `HERDR_A2A_TEST_TARGET_DIR` to choose a different private target
-directory.
+directory. Linux rejects tmpfs/ramfs build targets. Both the Rust test runner and
+`npm test` use `scripts/with-test-scratch.sh`: a private, disk-backed invocation
+root under `${XDG_CACHE_HOME:-$HOME/.cache}/herdr-a2a/test-scratch`, overridable with
+`HERDR_A2A_TEST_SCRATCH_ROOT`. Only test children inherit this `TMPDIR`; successful
+and nonzero exits remove only that invocation's scratch, never older roots or live
+A2A descriptors. SIGKILL/host failure can still leave owned disk scratch for later
+inspection. Cargo's reusable target cache is retained, not treated as disposable.
+Use the same wrapper for heavy development installs:
+`bash scripts/with-test-scratch.sh npm --prefix integrations/pi ci`.
 
 ```sh
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo fmt --all -- --check

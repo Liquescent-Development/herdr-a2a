@@ -13,6 +13,10 @@ target_dir=${HERDR_A2A_TEST_TARGET_DIR:-${HOME:?HOME is required}/.herdr-a2a-tes
 install -d -m 700 -- "$target_dir"
 chmod 700 -- "$target_dir"
 target_dir=$(CDPATH= cd -- "$target_dir" && pwd -P)
+if [[ $(uname -s) == Linux ]]; then
+    filesystem=$(findmnt -n -o FSTYPE -T "$target_dir")
+    [[ -n $filesystem && $filesystem != tmpfs && $filesystem != ramfs ]] || fail "target directory must be disk-backed: $target_dir"
+fi
 
 umask 0022
 export CARGO_BUILD_JOBS=2
@@ -22,4 +26,4 @@ unset CARGO_ENCODED_RUSTFLAGS
 export CARGO_TARGET_DIR=$target_dir
 
 cd "$repository_root"
-exec cargo test --workspace --all-features
+exec bash "$repository_root/scripts/with-test-scratch.sh" cargo test --workspace --all-features
