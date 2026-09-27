@@ -754,6 +754,26 @@ test("close retires an actual subprocess before resolving", { timeout: 2_000 }, 
   assert.ok(child.exitCode !== null || child.signalCode !== null);
 });
 
+test("a real child exit preserves stderr after stdout ends first", { timeout: 2_000 }, async () => {
+  // Break caught: stdout end wins the event race and hides the native startup failure.
+  const child = spawn(process.execPath, ["-e", [
+    'process.stdout.end();',
+    'process.stderr.write("native-startup-detail");',
+    'setTimeout(() => process.exit(23), 20);',
+  ].join("")], { stdio: ["pipe", "pipe", "pipe"] });
+  const client = new SessionClient(child, {
+    termGraceMs: 100,
+    killGraceMs: 500,
+  });
+
+  await assert.rejects(client.call("list_agents", {}), (error: Error) => {
+    assert.match(error.message, /client session exited with code 23/);
+    assert.match(error.message, /native-startup-detail/);
+    return true;
+  });
+  await client.close();
+});
+
 test("an already-aborted call is not written and a mid-call abort terminates all pending work", { timeout: 250 }, async () => {
   // Break caught: Pi aborts a tool while an indefinite broker wait keeps its turn/session hung.
   const process = new FakeSessionProcess();

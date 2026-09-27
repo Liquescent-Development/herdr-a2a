@@ -30,7 +30,9 @@ Ask reviewer to review commit <sha> and summarize the review.
 If the role is ambiguous, Pi asks you to select a canonical identity. If it is missing, it reports
 that fact and does not create a pane. Durable or security-sensitive work targets a canonical
 identity. Peer work queues after a busy turn, and the receiver replies automatically; you never
-need to request a manual receiver wake-up.
+need to request a manual receiver wake-up. The automatic inbox already keeps idle agents available,
+so use `a2a_wait_for_message` only for a specific expected reply, never merely to remain available.
+Its omitted timeout is five minutes.
 
 The Pi package also provides these A2A tools as an advanced/debugging reference:
 
