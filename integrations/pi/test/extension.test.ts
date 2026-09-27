@@ -491,6 +491,33 @@ test("explicit wait shares the automatic pump without duplicate native waits or 
   }
 });
 
+test("an omitted explicit wait timeout is bounded to five minutes", { timeout: 500 }, async () => {
+  // Break caught: a model that omits timeout_ms can leave its Pi turn in Working state for a day.
+  const pi = new FakePi();
+  const observedTimeout = deferred<number>();
+  registerHerdrA2A(pi as unknown as ExtensionAPI, {
+    startClient: async () => ({
+      call: async (_method, _params, signal) => waitUntilAborted(signal),
+      close: async () => undefined,
+    }),
+    sleep: async (milliseconds: number, signal: AbortSignal) => {
+      observedTimeout.resolve(milliseconds);
+      return waitUntilAborted(signal);
+    },
+  });
+  const { value } = context();
+  await pi.handlers.get("session_start")?.({} as never, value);
+  const wait = pi.tools.find((tool) => tool.name === "a2a_wait_for_message");
+  assert.ok(wait);
+  const controller = new AbortController();
+
+  const pending = wait.execute("explicit", {}, controller.signal, undefined, value);
+  assert.equal(await observedTimeout.promise, 300_000);
+  controller.abort();
+  await assert.rejects(pending, /explicit inbox wait aborted/);
+  await pi.handlers.get("session_shutdown")?.({} as never, value);
+});
+
 test("registers the default send timeout and bounded team tool without file-reference schemas", () => {
   // Break caught: an undeclared operation or deferred file-reference field becomes model-visible.
   const pi = new FakePi();
@@ -568,6 +595,17 @@ test("registers the default send timeout and bounded team tool without file-refe
     type: "string",
     minLength: 1,
     description: "Task ID returned by a timed-out or interrupted blocking send.",
+  });
+  const wait = pi.tools.find((tool) => tool.name === "a2a_wait_for_message");
+  assert.ok(wait);
+  const waitTimeout = (wait.parameters as {
+    properties: Record<string, Record<string, unknown>>;
+  }).properties.timeout_ms;
+  assert.deepEqual(waitTimeout, {
+    type: "integer",
+    minimum: 1_000,
+    maximum: 86_400_000,
+    default: 300_000,
   });
   for (const name of ["a2a_reply", "a2a_cancel_task"]) {
     const tool = pi.tools.find((candidate) => candidate.name === name);
@@ -744,6 +782,8 @@ test("default prompt appends bounded A2A rules without replacing existing contex
   assert.match(result.systemPrompt, /Use A2A for all peer requests/i);
   assert.match(result.systemPrompt, /never use terminal.*send-text.*send-keys.*agent prompt/is);
   assert.match(result.systemPrompt, /only after the user explicitly requests new panes/i);
+  assert.match(result.systemPrompt, /never call.*a2a_wait_for_message.*(?:remain|stay) available/is);
+  assert.match(result.systemPrompt, /automatic inbox.*idle/is);
   const instructions = (extensionModule as { A2A_SYSTEM_INSTRUCTIONS?: unknown })
     .A2A_SYSTEM_INSTRUCTIONS;
   assert.equal(typeof instructions, "string");
@@ -774,6 +814,8 @@ test("natural peer intent maps to automatic A2A delivery", async () => {
     assert.match(rules, /missing.*(?:do not|never).*create.*pane/i);
     assert.match(rules, /canonical identit(?:y|ies).*durable|durable.*canonical identit(?:y|ies)/i);
     assert.match(rules, /do not ask.*manual.*receiver/i);
+    assert.match(rules, /never call.*a2a_wait_for_message.*(?:remain|stay) available/is);
+    assert.match(rules, /automatic inbox.*idle/is);
   }
 });
 
@@ -2164,6 +2206,70 @@ test("a startup failure is not cached and the next call retries", async () => {
 
   assert.equal(starts, 2);
   assert.deepEqual(notifications, [["Herdr A2A unavailable: early child exit", "error"]]);
+});
+
+test("a startup failure retries automatically without a model tool call", { timeout: 500 }, async () => {
+  // Break caught: failed enrollment removes the agent from the directory, so no peer can wake it
+  // and no model call exists to trigger the otherwise-lazy replacement path.
+  const pi = new FakePi();
+  const retryScheduled = deferred<number>();
+  const releaseRetry = deferred();
+  const recovered = deferred();
+  let starts = 0;
+  registerHerdrA2A(pi as unknown as ExtensionAPI, {
+    startClient: async () => {
+      starts += 1;
+      if (starts === 1) throw new Error("temporary registration failure");
+      recovered.resolve();
+      return withPendingInbox({
+        call: async () => liveDirectory(),
+        close: async () => undefined,
+      });
+    },
+    sleep: async (milliseconds: number, signal: AbortSignal) => {
+      retryScheduled.resolve(milliseconds);
+      await Promise.race([
+        releaseRetry.promise,
+        waitUntilAborted(signal),
+      ]);
+    },
+  });
+  const { value, notifications } = context();
+
+  await pi.handlers.get("session_start")?.({} as never, value);
+  const delay = await retryScheduled.promise;
+  assert.ok(delay > 0 && delay <= 5_000);
+  assert.equal(starts, 1);
+  releaseRetry.resolve();
+  await recovered.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(starts, 2);
+  assert.deepEqual(notifications, [[
+    "Herdr A2A unavailable: temporary registration failure",
+    "error",
+  ]]);
+  await pi.handlers.get("session_shutdown")?.({} as never, value);
+});
+
+test("session shutdown cancels a pending automatic startup retry", async () => {
+  // Break caught: a failed startup leaves a retry timer and its captured session alive after Pi exits.
+  const pi = new FakePi();
+  const retryScheduled = deferred<AbortSignal>();
+  registerHerdrA2A(pi as unknown as ExtensionAPI, {
+    startClient: async () => { throw new Error("temporary registration failure"); },
+    sleep: async (_milliseconds: number, signal: AbortSignal) => {
+      retryScheduled.resolve(signal);
+      return waitUntilAborted(signal);
+    },
+  });
+  const { value } = context();
+
+  await pi.handlers.get("session_start")?.({} as never, value);
+  const retrySignal = await retryScheduled.promise;
+  await pi.handlers.get("session_shutdown")?.({} as never, value);
+
+  assert.equal(retrySignal.aborted, true);
 });
 
 test("a failed initial broker ensure is retried by the next A2A operation", async () => {

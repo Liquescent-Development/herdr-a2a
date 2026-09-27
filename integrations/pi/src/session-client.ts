@@ -21,6 +21,7 @@ const MANAGED_COMMAND_TIMEOUT_MS = 10_000;
 const DEFAULT_TERM_GRACE_MS = 500;
 const DEFAULT_KILL_GRACE_MS = 500;
 const DEFAULT_READINESS_TIMEOUT_MS = 5_000;
+const DEFAULT_STDOUT_EXIT_GRACE_MS = 50;
 const MAX_FUTURE_DESCRIPTOR_MS = 5 * 60 * 1_000;
 const MAX_PLATFORM_PID = 2_147_483_647;
 const execFile = promisify(nodeExecFile);
@@ -49,6 +50,7 @@ export interface SessionProcess {
 export interface SessionClientOptions {
   termGraceMs?: number;
   killGraceMs?: number;
+  stdoutExitGraceMs?: number;
 }
 
 interface PendingRequest {
@@ -96,11 +98,17 @@ export class SessionClient {
   #retirementPromise: Promise<void> | undefined;
   readonly #termGraceMs: number;
   readonly #killGraceMs: number;
+  readonly #stdoutExitGraceMs: number;
+  #stdoutEndTimer: NodeJS.Timeout | undefined;
 
   constructor(process: SessionProcess, options: SessionClientOptions = {}) {
     this.#process = process;
     this.#termGraceMs = boundedGrace(options.termGraceMs, DEFAULT_TERM_GRACE_MS);
     this.#killGraceMs = boundedGrace(options.killGraceMs, DEFAULT_KILL_GRACE_MS);
+    this.#stdoutExitGraceMs = boundedGrace(
+      options.stdoutExitGraceMs,
+      DEFAULT_STDOUT_EXIT_GRACE_MS,
+    );
     this.#processExited = process.exitCode !== null || process.signalCode !== null;
     this.#processClose = new Promise((resolve) => { this.#resolveProcessClose = resolve; });
     process.stdout.on("data", (chunk: Buffer | string) => this.#acceptStdout(chunk));
@@ -108,24 +116,18 @@ export class SessionClient {
     process.stdin.on("error", (error) => this.#fail(new Error(`client session stdin error: ${error.message}`)));
     process.stdout.on("error", (error) => this.#fail(new Error(`client session stdout error: ${error.message}`)));
     process.stderr.on("error", (error) => this.#fail(new Error(`client session stderr error: ${error.message}`)));
-    process.stdout.on("end", () => this.#fail(new Error("client session stdout ended unexpectedly")));
-    process.stdout.on("close", () => this.#fail(new Error("client session stdout ended unexpectedly")));
+    process.stdout.on("end", () => this.#scheduleStdoutEndFailure());
+    process.stdout.on("close", () => this.#scheduleStdoutEndFailure());
     process.on("error", (error) => this.#fail(new Error(`client session process error: ${error.message}`)));
     process.on("exit", (code, signal) => {
       this.#processExited = true;
-      if (this.#terminalError !== undefined) return;
-      const status = code === null ? `from signal ${signal ?? "unknown"}` : `with code ${code}`;
-      const context = this.#stderr.length === 0 ? "" : `: ${this.#stderr.toString("utf8")}`;
-      this.#fail(new Error(`client session exited ${status}${context}`), false);
+      this.#fail(this.#processFailure("exited", code, signal), false);
     });
     process.on("close", (code, signal) => {
       this.#processExited = true;
       this.#processClosed = true;
       this.#resolveProcessClose();
-      if (this.#terminalError === undefined) {
-        const status = code === null ? `from signal ${signal ?? "unknown"}` : `with code ${code}`;
-        this.#fail(new Error(`client session closed ${status}`), false);
-      }
+      this.#fail(this.#processFailure("closed", code, signal), false);
     });
   }
 
@@ -290,8 +292,31 @@ export class SessionClient {
     this.#fail(new Error(`client session protocol error: ${message}`));
   }
 
+  #scheduleStdoutEndFailure(): void {
+    if (this.#terminalError !== undefined || this.#stdoutEndTimer !== undefined) return;
+    this.#stdoutEndTimer = setTimeout(() => {
+      this.#stdoutEndTimer = undefined;
+      this.#fail(new Error("client session stdout ended unexpectedly"));
+    }, this.#stdoutExitGraceMs);
+    this.#stdoutEndTimer.unref();
+  }
+
+  #processFailure(
+    event: "exited" | "closed",
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): Error {
+    const status = code === null ? `from signal ${signal ?? "unknown"}` : `with code ${code}`;
+    const context = this.#stderr.length === 0 ? "" : `: ${this.#stderr.toString("utf8")}`;
+    return new Error(`client session ${event} ${status}${context}`);
+  }
+
   #fail(error: Error, kill = true): void {
     if (this.#terminalError !== undefined) return;
+    if (this.#stdoutEndTimer !== undefined) {
+      clearTimeout(this.#stdoutEndTimer);
+      this.#stdoutEndTimer = undefined;
+    }
     this.#terminalError = error;
     this.#rejectPending(error);
     if (kill) void this.#retire().catch(() => undefined);
