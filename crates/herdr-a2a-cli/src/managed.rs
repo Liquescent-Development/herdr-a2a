@@ -22,7 +22,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command};
 
-const OWNERSHIP_SCHEMA: u32 = 3;
+#[path = "managed/generation.rs"]
+mod generation;
+
+const LEGACY_OWNERSHIP_SCHEMA: u32 = 3;
+const OWNERSHIP_SCHEMA: u32 = 4;
 const OWNERSHIP_FILE: &str = "ownership.json";
 const INSTALL_LOCK: &str = "install.lock";
 const TRANSACTION_FILE: &str = "install-transaction.json";
@@ -111,34 +115,70 @@ pub struct OwnedFile {
     mode: u32,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnershipRecord {
     schema_version: u32,
     state: InstallState,
     plugin_version: String,
+    protocol_major: u32,
     broker_digest: String,
     pi_package_digest: String,
     pi_package_source: PathBuf,
     pi_config_path: PathBuf,
     pi_package_entry: Value,
     purge_authority: bool,
-    #[serde(default, skip_serializing_if = "path_is_empty")]
     plugin_state_root: PathBuf,
     rescue_path: PathBuf,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     rescue_marker_digest: String,
     install_kind: String,
     plugin_root: PathBuf,
     stable_binary: PathBuf,
     ownership_path: PathBuf,
     owned_files: Vec<OwnedFile>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_generations: Vec<generation::GenerationAuthorization>,
     last_error: Option<String>,
 }
 
-fn path_is_empty(path: &Path) -> bool {
-    path.as_os_str().is_empty()
+impl Serialize for OwnershipRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut record = serializer.serialize_struct("OwnershipRecord", 22)?;
+        record.serialize_field("schema_version", &self.schema_version)?;
+        record.serialize_field("state", &self.state)?;
+        record.serialize_field("plugin_version", &self.plugin_version)?;
+        if self.schema_version == OWNERSHIP_SCHEMA {
+            record.serialize_field("protocol_major", &self.protocol_major)?;
+        }
+        record.serialize_field("broker_digest", &self.broker_digest)?;
+        record.serialize_field("pi_package_digest", &self.pi_package_digest)?;
+        record.serialize_field("pi_package_source", &self.pi_package_source)?;
+        record.serialize_field("pi_config_path", &self.pi_config_path)?;
+        record.serialize_field("pi_package_entry", &self.pi_package_entry)?;
+        record.serialize_field("purge_authority", &self.purge_authority)?;
+        if !self.plugin_state_root.as_os_str().is_empty() {
+            record.serialize_field("plugin_state_root", &self.plugin_state_root)?;
+        }
+        record.serialize_field("rescue_path", &self.rescue_path)?;
+        if !self.rescue_marker_digest.is_empty() {
+            record.serialize_field("rescue_marker_digest", &self.rescue_marker_digest)?;
+        }
+        record.serialize_field("install_kind", &self.install_kind)?;
+        record.serialize_field("plugin_root", &self.plugin_root)?;
+        record.serialize_field("stable_binary", &self.stable_binary)?;
+        record.serialize_field("ownership_path", &self.ownership_path)?;
+        record.serialize_field("owned_files", &self.owned_files)?;
+        if self.schema_version == OWNERSHIP_SCHEMA {
+            record.serialize_field("retained_generations", &self.retained_generations)?;
+        }
+        if let Some(last_error) = &self.last_error {
+            record.serialize_field("last_error", last_error)?;
+        }
+        record.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -147,6 +187,7 @@ struct CompatibleOwnershipRecord {
     schema_version: u32,
     state: InstallState,
     plugin_version: String,
+    protocol_major: Option<u32>,
     broker_digest: String,
     pi_package_digest: String,
     pi_package_source: PathBuf,
@@ -161,6 +202,7 @@ struct CompatibleOwnershipRecord {
     stable_binary: PathBuf,
     ownership_path: PathBuf,
     owned_files: Vec<OwnedFile>,
+    retained_generations: Option<Vec<generation::GenerationAuthorization>>,
     last_error: Option<String>,
 }
 
@@ -170,11 +212,46 @@ enum DecodedOwnershipSchema {
     AuthoritativeV2,
     LegacyV3Authority,
     CurrentV3,
+    CurrentV4,
 }
 
 fn classify_compatible_record(
     record: &CompatibleOwnershipRecord,
 ) -> ManagedResult<DecodedOwnershipSchema> {
+    if record.schema_version == OWNERSHIP_SCHEMA {
+        if record.protocol_major.is_none() || record.retained_generations.is_none() {
+            return Err(ManagedError::new(
+                "ownership_record_invalid",
+                "ownership generation catalog fields are incompatible",
+            ));
+        }
+        return match (
+            record.purge_authority,
+            record.plugin_state_root.as_ref(),
+            record.rescue_marker_digest.as_deref(),
+        ) {
+            (Some(false), None, Some(marker_digest)) if valid_digest(marker_digest) => {
+                Ok(DecodedOwnershipSchema::CurrentV4)
+            }
+            (Some(true), Some(root), Some(marker_digest))
+                if !root.as_os_str().is_empty() && valid_digest(marker_digest) =>
+            {
+                Ok(DecodedOwnershipSchema::CurrentV4)
+            }
+            _ => Err(ManagedError::new(
+                "ownership_record_invalid",
+                "ownership schema authority fields are incompatible",
+            )),
+        };
+    }
+    if record.schema_version == LEGACY_OWNERSHIP_SCHEMA
+        && (record.protocol_major.is_some() || record.retained_generations.is_some())
+    {
+        return Err(ManagedError::new(
+            "ownership_record_invalid",
+            "legacy ownership record contains generation catalog fields",
+        ));
+    }
     match (
         record.schema_version,
         record.purge_authority,
@@ -187,22 +264,22 @@ fn classify_compatible_record(
         {
             Ok(DecodedOwnershipSchema::AuthoritativeV2)
         }
-        (OWNERSHIP_SCHEMA, None, Some(root), Some(marker_digest))
+        (LEGACY_OWNERSHIP_SCHEMA, None, Some(root), Some(marker_digest))
             if !root.as_os_str().is_empty() && valid_digest(marker_digest) =>
         {
             Ok(DecodedOwnershipSchema::LegacyV3Authority)
         }
-        (OWNERSHIP_SCHEMA, Some(false), None, Some(marker_digest))
+        (LEGACY_OWNERSHIP_SCHEMA, Some(false), None, Some(marker_digest))
             if valid_digest(marker_digest) =>
         {
             Ok(DecodedOwnershipSchema::CurrentV3)
         }
-        (OWNERSHIP_SCHEMA, Some(true), Some(root), Some(marker_digest))
+        (LEGACY_OWNERSHIP_SCHEMA, Some(true), Some(root), Some(marker_digest))
             if !root.as_os_str().is_empty() && valid_digest(marker_digest) =>
         {
             Ok(DecodedOwnershipSchema::CurrentV3)
         }
-        (2, ..) | (OWNERSHIP_SCHEMA, ..) => Err(ManagedError::new(
+        (2, ..) | (LEGACY_OWNERSHIP_SCHEMA, ..) => Err(ManagedError::new(
             "ownership_record_invalid",
             "ownership schema authority fields are incompatible",
         )),
@@ -240,7 +317,7 @@ impl TryFrom<CompatibleOwnershipRecord> for OwnershipRecord {
                         .rescue_marker_digest
                         .expect("classified legacy authority marker digest is present"),
                 ),
-                DecodedOwnershipSchema::CurrentV3 => (
+                DecodedOwnershipSchema::CurrentV3 | DecodedOwnershipSchema::CurrentV4 => (
                     record
                         .purge_authority
                         .expect("classified authority is present"),
@@ -259,6 +336,9 @@ impl TryFrom<CompatibleOwnershipRecord> for OwnershipRecord {
             schema_version: record.schema_version,
             state: record.state,
             plugin_version: record.plugin_version,
+            protocol_major: record
+                .protocol_major
+                .unwrap_or(generation::MANAGED_PROTOCOL_MAJOR),
             broker_digest: record.broker_digest,
             pi_package_digest: record.pi_package_digest,
             pi_package_source: record.pi_package_source,
@@ -273,6 +353,7 @@ impl TryFrom<CompatibleOwnershipRecord> for OwnershipRecord {
             stable_binary: record.stable_binary,
             ownership_path: record.ownership_path,
             owned_files: record.owned_files,
+            retained_generations: record.retained_generations.unwrap_or_default(),
             last_error: record.last_error,
         })
     }
@@ -785,7 +866,7 @@ where
     let record = Option::<CompatibleOwnershipRecord>::deserialize(deserializer)?;
     record
         .map(|mut record| {
-            if record.schema_version == OWNERSHIP_SCHEMA
+            if record.schema_version == LEGACY_OWNERSHIP_SCHEMA
                 && record.purge_authority.is_none()
                 && record.plugin_state_root.is_some()
                 && record.rescue_marker_digest.is_some()
@@ -3149,6 +3230,7 @@ fn build_record(
         schema_version: OWNERSHIP_SCHEMA,
         state,
         plugin_version: read_plugin_version(plugin_root)?,
+        protocol_major: generation::MANAGED_PROTOCOL_MAJOR,
         broker_digest,
         pi_package_digest,
         pi_package_source: generation.package.clone(),
@@ -3163,6 +3245,7 @@ fn build_record(
         stable_binary: generation.binary.clone(),
         ownership_path: stable_root.join(OWNERSHIP_FILE),
         owned_files,
+        retained_generations: Vec::new(),
         last_error: None,
     })
 }
@@ -4457,7 +4540,7 @@ fn rescue_layout(record: &OwnershipRecord, stable_root: &Path) -> ManagedResult<
         (0o600, None) => Ok(RescueLayout::SourceNotice),
         (0o700, None) => Ok(RescueLayout::LegacyExecutable),
         (0o700, Some(helper))
-            if record.schema_version == OWNERSHIP_SCHEMA
+            if record.schema_version >= LEGACY_OWNERSHIP_SCHEMA
                 && helper.mode == 0o700
                 && helper.sha256 == record.broker_digest =>
         {
@@ -4500,9 +4583,12 @@ fn validate_record_inner(
     validate_purge_root: bool,
 ) -> ManagedResult<()> {
     validate_record_semantics(record, stable_root, &record.plugin_root)?;
+    generation::validate_catalog(record, stable_root)?;
     let rescue_layout = rescue_layout(record, stable_root)?;
-    if !matches!(record.schema_version, 2 | OWNERSHIP_SCHEMA)
-        || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
+    if !matches!(
+        record.schema_version,
+        2 | LEGACY_OWNERSHIP_SCHEMA | OWNERSHIP_SCHEMA
+    ) || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
         || record.rescue_path != stable_root.join("rescue/uninstall.sh")
         || !matches!(record.install_kind.as_str(), "managed" | "linked-dev")
     {
@@ -4671,8 +4757,10 @@ fn validate_record_semantics(
     stable_root: &Path,
     plugin_root: &Path,
 ) -> ManagedResult<()> {
-    if !matches!(record.schema_version, 2 | OWNERSHIP_SCHEMA)
-        || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
+    if !matches!(
+        record.schema_version,
+        2 | LEGACY_OWNERSHIP_SCHEMA | OWNERSHIP_SCHEMA
+    ) || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
         || record.rescue_path != stable_root.join("rescue/uninstall.sh")
         || record.plugin_root != plugin_root
         || record.pi_config_path != pi_settings_path()?
@@ -4681,7 +4769,7 @@ fn validate_record_semantics(
         || record.plugin_version.len() > 128
         || !valid_digest(&record.broker_digest)
         || !valid_digest(&record.pi_package_digest)
-        || ((record.schema_version == OWNERSHIP_SCHEMA || record.purge_authority)
+        || ((record.schema_version >= LEGACY_OWNERSHIP_SCHEMA || record.purge_authority)
             && !valid_digest(&record.rescue_marker_digest))
         || (record.purge_authority && record.plugin_state_root.as_os_str().is_empty())
         || (!record.purge_authority && !record.plugin_state_root.as_os_str().is_empty())
@@ -6928,12 +7016,16 @@ fn migrate_accepted_v2_record(
     stable_root: &Path,
     record: &mut OwnershipRecord,
 ) -> ManagedResult<()> {
-    if record.schema_version != 2 || !record.purge_authority {
+    let migratable = record.schema_version == LEGACY_OWNERSHIP_SCHEMA
+        || (record.schema_version == 2 && record.purge_authority);
+    if !migratable {
         return Ok(());
     }
     validate_record(record, stable_root)?;
     validate_pi_entry_if_present(record)?;
     record.schema_version = OWNERSHIP_SCHEMA;
+    record.protocol_major = generation::MANAGED_PROTOCOL_MAJOR;
+    record.retained_generations.clear();
     write_record(stable_root, record)
 }
 
@@ -10373,9 +10465,14 @@ mod descriptor_tree_tests {
             "ownership_path": "/stable/ownership.json",
             "owned_files": []
         });
-        if schema_version == OWNERSHIP_SCHEMA {
+        if schema_version >= LEGACY_OWNERSHIP_SCHEMA {
             value["plugin_state_root"] = serde_json::json!("/plugin-state");
             value["rescue_marker_digest"] = serde_json::json!("c".repeat(64));
+        }
+        if schema_version == OWNERSHIP_SCHEMA {
+            value["purge_authority"] = serde_json::json!(true);
+            value["protocol_major"] = serde_json::json!(generation::MANAGED_PROTOCOL_MAJOR);
+            value["retained_generations"] = serde_json::json!([]);
         }
         value
     }
@@ -10458,24 +10555,25 @@ mod descriptor_tree_tests {
     fn embedded_legacy_schema_v3_record_derives_its_recorded_purge_authority() {
         // Break caught: compatibility either rejects an exact old v3 journal or strips authority
         // that its authenticated state-root shape already established.
-        let record: OwnershipRecord = serde_json::from_value(predecessor_record(OWNERSHIP_SCHEMA))
-            .expect("legacy schema v3 must decode");
+        let record: OwnershipRecord =
+            serde_json::from_value(predecessor_record(LEGACY_OWNERSHIP_SCHEMA))
+                .expect("legacy schema v3 must decode");
         assert!(record.purge_authority);
         assert_eq!(record.plugin_state_root, Path::new("/plugin-state"));
     }
 
     #[test]
     fn embedded_legacy_schema_v3_record_rejects_incomplete_authority_shapes() {
-        let mut missing_root = predecessor_record(OWNERSHIP_SCHEMA);
+        let mut missing_root = predecessor_record(LEGACY_OWNERSHIP_SCHEMA);
         missing_root
             .as_object_mut()
             .expect("record is an object")
             .remove("plugin_state_root");
 
-        let mut empty_root = predecessor_record(OWNERSHIP_SCHEMA);
+        let mut empty_root = predecessor_record(LEGACY_OWNERSHIP_SCHEMA);
         empty_root["plugin_state_root"] = serde_json::json!("");
 
-        let mut invalid_marker = predecessor_record(OWNERSHIP_SCHEMA);
+        let mut invalid_marker = predecessor_record(LEGACY_OWNERSHIP_SCHEMA);
         invalid_marker["rescue_marker_digest"] = serde_json::json!("not-a-digest");
 
         for incompatible in [missing_root, empty_root, invalid_marker] {
