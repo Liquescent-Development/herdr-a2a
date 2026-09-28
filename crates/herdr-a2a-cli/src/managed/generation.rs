@@ -25,7 +25,6 @@ pub(crate) struct GenerationAuthorization {
     pub owned_files: Vec<OwnedFile>,
 }
 
-#[allow(dead_code)] // Consumed by generation-aware process ownership in the dependent task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthorizedGeneration<'a> {
     Current,
@@ -178,7 +177,32 @@ fn validate_generation(
     Ok(())
 }
 
-#[allow(dead_code)] // Consumed by generation-aware process ownership in the dependent task.
+pub(crate) fn authorize_transition(
+    record: &OwnershipRecord,
+    running_path: &Path,
+    running_digest: &str,
+    descriptor_path: &Path,
+    descriptor_digest: &str,
+) -> ManagedResult<()> {
+    let protocol = |authorization| match authorization {
+        AuthorizedGeneration::Current => record.protocol_major,
+        AuthorizedGeneration::Retained(retained) => retained.protocol_major,
+    };
+    let running = protocol(authorize_executable(record, running_path, running_digest)?);
+    let descriptor = protocol(authorize_executable(
+        record,
+        descriptor_path,
+        descriptor_digest,
+    )?);
+    if running != descriptor {
+        return Err(ManagedError::new(
+            "generation_incompatible",
+            "managed generations use incompatible protocol majors",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn authorize_executable<'a>(
     record: &'a OwnershipRecord,
     path: &Path,
@@ -284,6 +308,61 @@ mod tests {
                 &"a".repeat(64),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_transition_accepts_compatible_directions_and_rejects_others() {
+        let mut record = record();
+        let current = Path::new("/stable/generations/current/bin/herdr-a2a");
+        let retained = Path::new("/stable/generations/retained/bin/herdr-a2a");
+        let current_digest = "a".repeat(64);
+        let retained_digest = "d".repeat(64);
+        assert!(
+            super::authorize_transition(
+                &record,
+                current,
+                &current_digest,
+                retained,
+                &retained_digest,
+            )
+            .is_ok()
+        );
+        assert!(
+            super::authorize_transition(
+                &record,
+                retained,
+                &retained_digest,
+                current,
+                &current_digest,
+            )
+            .is_ok()
+        );
+
+        record.retained_generations[0].protocol_major = 2;
+        assert_eq!(
+            super::authorize_transition(
+                &record,
+                current,
+                &current_digest,
+                retained,
+                &retained_digest,
+            )
+            .unwrap_err()
+            .code,
+            "generation_incompatible"
+        );
+        assert_eq!(
+            super::authorize_transition(
+                &record,
+                current,
+                &current_digest,
+                Path::new("/unowned/herdr-a2a"),
+                &retained_digest,
+            )
+            .unwrap_err()
+            .code,
+            "owned_process_mismatch"
         );
     }
 

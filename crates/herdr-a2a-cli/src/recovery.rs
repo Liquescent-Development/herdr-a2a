@@ -21,6 +21,7 @@ use crate::{
     DynError,
     coordinator::{BrokerLauncher, LaunchError},
     health::verify_broker_proof,
+    managed,
 };
 
 const REGISTRATION_HEADER: &str = "x-herdr-a2a-registration";
@@ -141,6 +142,7 @@ impl Default for CancellationSignal {
 pub(crate) enum RecoveryError {
     Unavailable(String),
     DescriptorInvalid(String),
+    GenerationIncompatible(String),
     ProofInvalid(String),
     RegistrationRejected(String),
     Deadline,
@@ -153,6 +155,9 @@ impl fmt::Display for RecoveryError {
             Self::Unavailable(reason) => write!(formatter, "broker unavailable: {reason}"),
             Self::DescriptorInvalid(reason) => {
                 write!(formatter, "runtime descriptor is invalid: {reason}")
+            }
+            Self::GenerationIncompatible(reason) => {
+                write!(formatter, "managed generation is incompatible: {reason}")
             }
             Self::ProofInvalid(reason) => write!(formatter, "broker proof is invalid: {reason}"),
             Self::RegistrationRejected(reason) => {
@@ -168,6 +173,7 @@ impl RecoveryError {
     pub(crate) fn response_code(&self) -> &'static str {
         match self {
             Self::Deadline => "recovery_timeout",
+            Self::GenerationIncompatible(_) => "generation_incompatible",
             Self::Unavailable(_)
             | Self::DescriptorInvalid(_)
             | Self::ProofInvalid(_)
@@ -539,9 +545,16 @@ fn validate_recovered_descriptor(
         ));
     }
     if descriptor.executable_path != identity.executable {
-        return Err(RecoveryError::DescriptorInvalid(
-            "executable identity changed during recovery".to_owned(),
-        ));
+        managed::authorize_generation_transition(&identity.executable, &descriptor.executable_path)
+            .map_err(|error| {
+                if error.code() == "generation_incompatible" {
+                    RecoveryError::GenerationIncompatible(error.to_string())
+                } else {
+                    RecoveryError::DescriptorInvalid(
+                        "executable identity changed during recovery".to_owned(),
+                    )
+                }
+            })?;
     }
     Ok(())
 }
@@ -1032,6 +1045,10 @@ mod tests {
         assert_eq!(
             RecoveryError::DescriptorInvalid("changed".to_owned()).response_code(),
             "recovery_unavailable"
+        );
+        assert_eq!(
+            RecoveryError::GenerationIncompatible("protocol".to_owned()).response_code(),
+            "generation_incompatible"
         );
     }
 

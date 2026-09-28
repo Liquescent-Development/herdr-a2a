@@ -85,6 +85,10 @@ impl ManagedError {
     fn io(code: &'static str, context: &str, error: io::Error) -> Self {
         Self::new(code, format!("{context}: {error}"))
     }
+
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
 }
 
 impl std::fmt::Display for ManagedError {
@@ -391,6 +395,15 @@ pub(crate) struct ManagedProcessEntry {
     pub executable_digest: String,
     pub control_port: u16,
     pub control_nonce: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Public crate interface for managed launch and diagnostics consumers.
+pub(crate) struct ManagedGenerationIdentity {
+    pub executable_path: PathBuf,
+    pub executable_digest: String,
+    pub protocol_major: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2362,6 +2375,74 @@ pub(crate) fn unregister_managed_process(entry: &ManagedProcessEntry) -> Result<
     Ok(())
 }
 
+#[allow(dead_code)] // Public crate interface for managed launch and diagnostics consumers.
+pub(crate) fn managed_generation_identity(
+    executable: &Path,
+) -> ManagedResult<Option<ManagedGenerationIdentity>> {
+    if env::var_os("HERDR_A2A_PLUGIN_ROOT").is_none() {
+        return Ok(None);
+    }
+    let stable_root = stable_root()?;
+    validate_private_directory(&stable_root, 0o700)?;
+    let record = read_record(&stable_root)?;
+    validate_record(&record, &stable_root)?;
+    let executable_path = executable.canonicalize().map_err(|error| {
+        ManagedError::io(
+            "owned_process_mismatch",
+            "cannot resolve managed generation executable",
+            error,
+        )
+    })?;
+    let executable_digest = digest_file(&executable_path)?;
+    let authorization =
+        generation::authorize_executable(&record, &executable_path, &executable_digest)?;
+    let protocol_major = match authorization {
+        generation::AuthorizedGeneration::Current => record.protocol_major,
+        generation::AuthorizedGeneration::Retained(retained) => retained.protocol_major,
+    };
+    Ok(Some(ManagedGenerationIdentity {
+        executable_path,
+        executable_digest,
+        protocol_major,
+    }))
+}
+
+pub(crate) fn authorize_generation_transition(
+    running: &Path,
+    descriptor: &Path,
+) -> ManagedResult<()> {
+    if env::var_os("HERDR_A2A_PLUGIN_ROOT").is_none() {
+        return Err(ManagedError::new(
+            "owned_process_mismatch",
+            "generation transition is outside managed plugin context",
+        ));
+    }
+    let stable_root = stable_root()?;
+    validate_private_directory(&stable_root, 0o700)?;
+    let record = read_record(&stable_root)?;
+    validate_record(&record, &stable_root)?;
+    let resolve = |path: &Path| -> ManagedResult<(PathBuf, String)> {
+        let path = path.canonicalize().map_err(|error| {
+            ManagedError::io(
+                "owned_process_mismatch",
+                "cannot resolve managed generation executable",
+                error,
+            )
+        })?;
+        let digest = digest_file(&path)?;
+        Ok((path, digest))
+    };
+    let (running_path, running_digest) = resolve(running)?;
+    let (descriptor_path, descriptor_digest) = resolve(descriptor)?;
+    generation::authorize_transition(
+        &record,
+        &running_path,
+        &running_digest,
+        &descriptor_path,
+        &descriptor_digest,
+    )
+}
+
 fn validate_process_entry(
     entry: &ManagedProcessEntry,
     record: &OwnershipRecord,
@@ -2391,8 +2472,12 @@ fn validate_process_entry(
     if entry.coordinator_pid == 0
         || entry.broker_pid == 0
         || entry.control_port == 0
-        || entry.executable_path != record.stable_binary
-        || entry.executable_digest != record.broker_digest
+        || generation::authorize_executable(
+            record,
+            &entry.executable_path,
+            &entry.executable_digest,
+        )
+        .is_err()
         || entry.scope_key.len() != 64
         || entry.session_key.len() != 64
         || entry.executable_digest.len() != 64
@@ -2443,9 +2528,13 @@ fn validate_starting_process_entry(
     }
     if entry.coordinator_pid == 0
         || entry.control_port == 0
-        || entry.executable_path != record.stable_binary
-        || entry.executable_digest != record.broker_digest
-        || entry.expected_generation != expected_generation_for_record(record)?
+        || generation::authorize_executable(
+            record,
+            &entry.executable_path,
+            &entry.executable_digest,
+        )
+        .is_err()
+        || entry.expected_generation != generation_name(&entry.executable_path)?
         || entry.scope_key.len() != 64
         || entry.session_key.len() != 64
         || entry.executable_digest.len() != 64
@@ -2468,6 +2557,14 @@ fn validate_starting_process_entry(
     }
     if let Some(broker) = &entry.broker {
         validate_starting_broker_proof(broker, record)?;
+        if broker.executable_path != entry.executable_path
+            || broker.executable_digest != entry.executable_digest
+        {
+            return Err(ManagedError::new(
+                "owned_process_mismatch",
+                "starting coordinator and broker generations differ",
+            ));
+        }
     }
     Ok(())
 }
@@ -2491,8 +2588,12 @@ fn validate_starting_broker_proof(
         }
     }
     if broker.broker_pid == 0
-        || broker.executable_path != record.stable_binary
-        || broker.executable_digest != record.broker_digest
+        || generation::authorize_executable(
+            record,
+            &broker.executable_path,
+            &broker.executable_digest,
+        )
+        .is_err()
         || broker.executable_digest.len() != 64
         || !broker
             .executable_digest
@@ -2507,8 +2608,7 @@ fn validate_starting_broker_proof(
     Ok(())
 }
 
-fn expected_generation_for_record(record: &OwnershipRecord) -> ManagedResult<String> {
-    let binary = &record.stable_binary;
+fn generation_name(binary: &Path) -> ManagedResult<String> {
     let Some(bin) = binary.parent() else {
         return Err(ManagedError::new(
             "owned_process_mismatch",
@@ -11174,5 +11274,85 @@ mod schema_v2_migration_adjacency_tests {
             !source.contains(&forbidden),
             "product source must not expose a test-named executable identity override"
         );
+    }
+}
+
+#[cfg(test)]
+mod generation_process_tests {
+    use super::*;
+
+    fn record() -> OwnershipRecord {
+        let current = "a".repeat(32);
+        let retained = "b".repeat(32);
+        serde_json::from_value(serde_json::json!({
+            "schema_version": OWNERSHIP_SCHEMA,
+            "state": "Ready",
+            "plugin_version": "1.0.0",
+            "protocol_major": 1,
+            "broker_digest": "c".repeat(64),
+            "pi_package_digest": "d".repeat(64),
+            "pi_package_source": format!("/stable/generations/{current}/pi"),
+            "pi_config_path": "/pi/settings.json",
+            "pi_package_entry": format!("/stable/generations/{current}/pi"),
+            "purge_authority": false,
+            "rescue_path": "/stable/rescue/uninstall.sh",
+            "rescue_marker_digest": "e".repeat(64),
+            "install_kind": "managed",
+            "plugin_root": "/plugin",
+            "stable_binary": format!("/stable/generations/{current}/bin/herdr-a2a"),
+            "ownership_path": "/stable/ownership.json",
+            "owned_files": [],
+            "retained_generations": [{
+                "plugin_version": "0.9.0",
+                "protocol_major": 1,
+                "broker_digest": "f".repeat(64),
+                "pi_package_digest": "1".repeat(64),
+                "pi_package_source": format!("/stable/generations/{retained}/pi"),
+                "stable_binary": format!("/stable/generations/{retained}/bin/herdr-a2a"),
+                "owned_files": []
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn process(path: PathBuf, digest: String, scope: char) -> ManagedProcessEntry {
+        ManagedProcessEntry {
+            runtime_root: PathBuf::from("/runtime"),
+            session_key: "2".repeat(64),
+            workspace_id: format!("workspace-{scope}"),
+            scope_key: scope.to_string().repeat(64),
+            coordinator_pid: 1,
+            coordinator_start: "coordinator".to_owned(),
+            broker_pid: 2,
+            broker_start: "broker".to_owned(),
+            broker_instance_id: "instance".to_owned(),
+            executable_path: path,
+            executable_digest: digest,
+            control_port: 1,
+            control_nonce: "nonce".to_owned(),
+        }
+    }
+
+    #[test]
+    fn mixed_generation_process_entries_validate_against_their_own_identity() {
+        let record = record();
+        let current = process(
+            record.stable_binary.clone(),
+            record.broker_digest.clone(),
+            '3',
+        );
+        let retained = &record.retained_generations[0];
+        let retained = process(
+            retained.stable_binary.clone(),
+            retained.broker_digest.clone(),
+            '4',
+        );
+
+        assert!(validate_process_entry(&current, &record).is_ok());
+        assert!(validate_process_entry(&retained, &record).is_ok());
+
+        let mut tampered = retained;
+        tampered.executable_digest = record.broker_digest.clone();
+        assert!(validate_process_entry(&tampered, &record).is_err());
     }
 }
