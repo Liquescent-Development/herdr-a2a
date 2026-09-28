@@ -1163,7 +1163,7 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
 
     let stable_root = stable_root()?;
     create_private_directory(&stable_root)?;
-    let mut install_lock = acquire_install_lock(&stable_root)?;
+    let install_lock = acquire_install_lock(&stable_root)?;
     reconcile_rescue_migration(&stable_root)?;
     reconcile_transaction(&stable_root).await?;
     if let Some(snapshot) = pi.as_mut() {
@@ -1223,23 +1223,11 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             && (record.broker_digest != broker_digest || record.pi_package_digest != package_digest)
     });
     if replacing_generation {
-        let record = prior.as_ref().unwrap();
-        let registered = read_process_registry(&stable_root, record)?;
-        let starting = read_starting_process_registry(&stable_root, record)?;
-        if !registered.is_empty() || !starting.is_empty() {
-            drop(install_lock);
-            drain_managed_processes(&stable_root, record).await?;
-            install_lock = acquire_install_lock(&stable_root)?;
-            if read_record_optional(&stable_root)? != prior
-                || !read_process_registry(&stable_root, record)?.is_empty()
-                || !read_starting_process_registry(&stable_root, record)?.is_empty()
-            {
-                return Err(ManagedError::new(
-                    "owned_process_mismatch",
-                    "managed installation changed during coordinated update stop",
-                ));
-            }
-        }
+        generation::ensure_retained_capacity(
+            prior
+                .as_ref()
+                .expect("replacing generation has a prior record"),
+        )?;
     }
     let _install_lock = install_lock;
     let (generation_directory, generation_files) = generation_plan(
@@ -1424,6 +1412,25 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             return rollback_transaction_error(&stable_root, error).await;
         }
     };
+    if let Some(prior) = prior
+        .as_ref()
+        .filter(|prior| prior.state != InstallState::Removed)
+    {
+        record.retained_generations = prior.retained_generations.clone();
+    }
+    if replacing_generation {
+        let prior = prior
+            .as_ref()
+            .expect("replacing generation has a prior record");
+        let retained = generation::authorization_from_current(prior)?;
+        if !record
+            .retained_generations
+            .iter()
+            .any(|existing| existing.stable_binary == retained.stable_binary)
+        {
+            record.retained_generations.push(retained);
+        }
+    }
     if let Some(snapshot) = pi {
         journal.phase = TransactionPhase::PiMutating;
         if let Err(error) = write_transaction(&stable_root, &journal) {
@@ -1508,14 +1515,6 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
         && let Err(error) = swap.commit()
     {
         eprintln!("herdr-a2a: installed assets committed; deferred backup cleanup: {error}");
-    }
-    if let Some(prior) = prior {
-        remove_superseded_generation(
-            &stable_root,
-            &prior,
-            &record,
-            journal.prior_generation_snapshot.as_ref(),
-        )?;
     }
     clear_transaction(&stable_root)?;
     print_state(&record.state);
@@ -2965,7 +2964,7 @@ async fn remove_exact_pi_entry(record: &OwnershipRecord) -> ManagedResult<()> {
 fn validate_removal_inventory(record: &OwnershipRecord, stable_root: &Path) -> ManagedResult<()> {
     validate_record_semantics(record, stable_root, &record.plugin_root)
         .map_err(|error| ManagedError::new("ownership_record_missing", error.to_string()))?;
-    for owned in &record.owned_files {
+    for owned in all_generation_owned_files(record) {
         match fs::symlink_metadata(&owned.path) {
             Ok(_) => {
                 validate_owned_file_digest(
@@ -3016,6 +3015,9 @@ fn remove_recorded_assets_except(
     retained: &BTreeSet<PathBuf>,
 ) -> ManagedResult<()> {
     let mut owned = record.owned_files.clone();
+    for generation in &record.retained_generations {
+        owned.extend(generation.owned_files.clone());
+    }
     owned.sort_by_key(|file| std::cmp::Reverse(file.path.components().count()));
     for file in owned {
         if !retained.contains(&file.path) {
@@ -3125,27 +3127,53 @@ fn unlink_recorded_owned_file(expected: &OwnedFile) -> ManagedResult<()> {
     })
 }
 
+fn all_generation_owned_files(record: &OwnershipRecord) -> Vec<&OwnedFile> {
+    record
+        .owned_files
+        .iter()
+        .chain(
+            record
+                .retained_generations
+                .iter()
+                .flat_map(|generation| generation.owned_files.iter()),
+        )
+        .collect()
+}
+
 fn removal_directories(
     record: &OwnershipRecord,
     stable_root: &Path,
 ) -> ManagedResult<Vec<PathBuf>> {
-    let generation = record.pi_package_source.parent().ok_or_else(|| {
+    let mut generation_roots = vec![record.pi_package_source.parent().ok_or_else(|| {
         ManagedError::new(
             "ownership_record_missing",
             "managed generation root is absent",
         )
-    })?;
+    })?];
+    for retained in &record.retained_generations {
+        generation_roots.push(retained.pi_package_source.parent().ok_or_else(|| {
+            ManagedError::new(
+                "ownership_record_missing",
+                "retained generation root is absent",
+            )
+        })?);
+    }
     let mut directories = BTreeSet::new();
-    directories.insert(generation.to_path_buf());
+    directories.extend(generation_roots.iter().map(|root| (*root).to_path_buf()));
     directories.insert(stable_root.join(RESCUE_DIRECTORY));
     directories.insert(record.plugin_root.join("libexec"));
-    for owned in &record.owned_files {
-        let mut parent = owned.path.parent();
-        while let Some(directory) = parent {
-            if directory == generation || directory.starts_with(generation) {
-                directories.insert(directory.to_path_buf());
-                parent = directory.parent();
-            } else {
+    for owned in all_generation_owned_files(record) {
+        for generation in &generation_roots {
+            if owned.path.starts_with(generation) {
+                let mut parent = owned.path.parent();
+                while let Some(directory) = parent {
+                    if directory == *generation || directory.starts_with(*generation) {
+                        directories.insert(directory.to_path_buf());
+                        parent = directory.parent();
+                    } else {
+                        break;
+                    }
+                }
                 break;
             }
         }
@@ -5052,7 +5080,7 @@ fn validate_removed_record_for_reinstall(
         ));
     }
     validate_record_semantics(record, stable_root, &record.plugin_root)?;
-    for owned in &record.owned_files {
+    for owned in all_generation_owned_files(record) {
         match fs::symlink_metadata(&owned.path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -8310,7 +8338,12 @@ async fn reconcile_transaction(stable_root: &Path) -> ManagedResult<()> {
         })?;
         validate_record(current, stable_root)?;
         cleanup_transaction_artifacts(&transaction)?;
-        if let Some(prior) = &transaction.prior_record {
+        if let Some(prior) = &transaction.prior_record
+            && !current
+                .retained_generations
+                .iter()
+                .any(|generation| generation.stable_binary == prior.stable_binary)
+        {
             remove_superseded_generation(
                 stable_root,
                 prior,
@@ -8524,7 +8557,12 @@ fn complete_predecessor_forward_commit(
     transaction.phase = TransactionPhase::RecordCommitted;
     write_transaction(stable_root, &transaction)?;
     cleanup_transaction_artifacts(&transaction)?;
-    if let Some(prior) = &transaction.prior_record {
+    if let Some(prior) = &transaction.prior_record
+        && !current
+            .retained_generations
+            .iter()
+            .any(|generation| generation.stable_binary == prior.stable_binary)
+    {
         remove_superseded_generation(
             stable_root,
             prior,

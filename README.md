@@ -98,7 +98,20 @@ The plugin, native binary, and Pi adapter must share one release version. The ma
 supports Pi `>=0.84.2` and Typebox `>=1.3.7 <1.4.0`; install checks this compatibility
 before changing managed state, and Doctor reports the same exact ranges.
 
-## Removal and recovery
+## Updates, removal, and recovery
+
+Managed updates publish a new immutable current generation without stopping healthy brokers from
+older authenticated generations. Existing workspaces continue on their retained generation; new
+workspaces start the current generation. Binary, adapter modules, and skill files remain available
+for long-lived Pi sessions. Recovery uses bounded ten-second epochs inside the caller's original
+operation deadline, so explicit long message waits remain intact without blocking unrelated
+requests indefinitely.
+
+Up to 64 prior generations are retained and authenticated. Reaching that bound fails before the
+installation is changed. Generations are never pruned merely because they appear unused. The first
+update from a pre-fix client preserves its files and live broker, but if that old broker later dies,
+the pre-fix Pi session may require restart. Normal removal deletes every authenticated generation
+while retaining durable workspace data; purge additionally deletes that durable data.
 
 The supported clean-removal path is:
 

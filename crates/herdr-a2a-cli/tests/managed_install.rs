@@ -3806,14 +3806,22 @@ fn managed_remove_reconciles_an_authenticated_fully_retired_registration() {
 }
 
 #[test]
-fn managed_update_stops_registered_workspace_before_replacing_generation() {
-    // Break caught: update deleted the old generation while its registered broker remained live,
-    // leaving a process registry that the new ownership record could never authenticate.
+fn managed_update_retains_live_workspace_and_prior_generation() {
+    // Break caught: update drains a healthy old workspace or deletes adapter and skill resources
+    // still referenced by its long-lived Pi process.
     let fixture = ManagedFixture::new();
     let first = fixture.bundle("1.0.0", "adapter one\n");
     let second = fixture.bundle("2.0.0", "adapter two\n");
     assert_success(&fixture.install(&first));
-    let first_binary = PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap());
+    let first_record = fixture.record();
+    let first_binary = PathBuf::from(first_record["stable_binary"].as_str().unwrap());
+    let first_generation = first_binary
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let original_skill = fs::read(first_generation.join("pi/skills/herdr-a2a/SKILL.md")).unwrap();
     let runtime = fixture.base.join("runtime update");
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3847,31 +3855,67 @@ fn managed_update_stops_registered_workspace_before_replacing_generation() {
     );
 
     let update = fixture.install(&second);
-    let exit_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < exit_deadline && child.try_wait().unwrap().is_none() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let exited = child.try_wait().unwrap().is_some();
-    if !exited {
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
 
     assert_success(&update);
     assert!(
-        exited,
-        "managed update left the old registered broker alive"
+        child.try_wait().unwrap().is_none(),
+        "managed update drained the old broker"
+    );
+    assert!(
+        first_binary.exists(),
+        "managed update deleted the prior binary"
     );
     assert_eq!(
-        fs::read_to_string(&registry).unwrap_or_default(),
-        "HERDR_A2A_PROCESS_REGISTRY_V1\n",
-        "managed update retained a stale process registration"
+        fs::read(first_generation.join("pi/skills/herdr-a2a/SKILL.md")).unwrap(),
+        original_skill
     );
+    assert!(
+        fs::read_to_string(&registry)
+            .unwrap_or_default()
+            .contains("workspace-update"),
+        "managed update deleted the live process registration"
+    );
+    let updated = fixture.record();
     assert_ne!(
-        PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap()),
+        PathBuf::from(updated["stable_binary"].as_str().unwrap()),
         first_binary,
         "managed update did not publish the replacement generation"
     );
+    assert_eq!(updated["retained_generations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        updated["retained_generations"][0]["stable_binary"],
+        first_record["stable_binary"]
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn managed_remove_deletes_current_and_retained_generations() {
+    let fixture = ManagedFixture::new();
+    let first = fixture.bundle("1.0.0", "adapter one\n");
+    let second = fixture.bundle("2.0.0", "adapter two\n");
+    assert_success(&fixture.install(&first));
+    let first_root = PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert_success(&fixture.install(&second));
+    let second_root = PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fixture.herdr().set_unregister_success_and_plugin_absent();
+
+    assert_success(&fixture.remove(false, false));
+
+    assert!(!first_root.exists());
+    assert!(!second_root.exists());
 }
 
 #[test]

@@ -23,6 +23,13 @@ Use these rules for peer requests, replies, reviews, delegation, coordination, a
 
 Never use terminal `send-text`, `send-keys`, `agent prompt`, or agent-prompt injection as a peer-message fallback.
 
+Native recovery runs in bounded ten-second epochs without shortening an explicit long message wait.
+After a managed update, existing workspaces may continue on an authenticated retained generation
+while new workspaces use the current generation. Retained assets are not automatically pruned. A
+Pi session running the pre-fix adapter may require one restart if its old broker dies after the
+first fixed update. Managed removal deletes all authenticated generations but preserves durable
+workspace data unless purge was explicitly confirmed.
+
 Create or spawn teammate panes only after the user explicitly authorizes new panes. Requests merely to coordinate, delegate, or use a team do not grant spawn authority.
 
 ## Quick reference

@@ -31,6 +31,42 @@ pub(crate) enum AuthorizedGeneration<'a> {
     Retained(&'a GenerationAuthorization),
 }
 
+pub(crate) fn ensure_retained_capacity(record: &OwnershipRecord) -> ManagedResult<()> {
+    if record.retained_generations.len() >= MAX_RETAINED_GENERATIONS {
+        return Err(ManagedError::new(
+            "retained_generation_limit",
+            "managed update would exceed 64 retained generations",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn authorization_from_current(
+    record: &OwnershipRecord,
+) -> ManagedResult<GenerationAuthorization> {
+    let root = record.pi_package_source.parent().ok_or_else(|| {
+        ManagedError::new(
+            "ownership_record_invalid",
+            "current generation package has no parent",
+        )
+    })?;
+    let owned_files = record
+        .owned_files
+        .iter()
+        .filter(|owned| owned.path.starts_with(root))
+        .cloned()
+        .collect();
+    Ok(GenerationAuthorization {
+        plugin_version: record.plugin_version.clone(),
+        protocol_major: record.protocol_major,
+        broker_digest: record.broker_digest.clone(),
+        pi_package_digest: record.pi_package_digest.clone(),
+        pi_package_source: record.pi_package_source.clone(),
+        stable_binary: record.stable_binary.clone(),
+        owned_files,
+    })
+}
+
 pub(crate) fn validate_catalog(record: &OwnershipRecord, stable_root: &Path) -> ManagedResult<()> {
     validate_catalog_semantics(record, stable_root)?;
     for retained in &record.retained_generations {
@@ -363,6 +399,17 @@ mod tests {
             .unwrap_err()
             .code,
             "owned_process_mismatch"
+        );
+    }
+
+    #[test]
+    fn retained_generation_capacity_fails_before_a_sixty_fifth_entry() {
+        let retained = record().retained_generations.pop().unwrap();
+        let mut full = record();
+        full.retained_generations = vec![retained; MAX_RETAINED_GENERATIONS];
+        assert_eq!(
+            super::ensure_retained_capacity(&full).unwrap_err().code,
+            "retained_generation_limit"
         );
     }
 
