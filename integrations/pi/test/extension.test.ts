@@ -535,6 +535,8 @@ test("registers the default send timeout and bounded team tool without file-refe
   assert.doesNotMatch(advertised, /file_refs|fileReferences|files/);
   const send = pi.tools.find((tool) => tool.name === "a2a_send_message");
   assert.ok(send);
+  assert.match(send.description, /timeout.*does not cancel.*confirmed.*task/is);
+  assert.match(send.description, /resume.*resolved canonical identity/is);
   const sendParameters = send.parameters as {
     type: string;
     properties: Record<string, Record<string, unknown>>;
@@ -584,17 +586,19 @@ test("registers the default send timeout and bounded team tool without file-refe
   assert.deepEqual(sendParameters.properties.wait, {
     type: "boolean",
     default: true,
+    description: "Wait for a terminal reply. A false value returns after enqueueing; a wait timeout does not cancel confirmed work.",
   });
   assert.deepEqual(sendParameters.properties.timeout_ms, {
     type: "integer",
     minimum: 1_000,
     maximum: 86_400_000,
     default: 900_000,
+    description: "Maximum wait for this call, not the task lifetime. Choose a duration appropriate for the requested work.",
   });
   assert.deepEqual(sendParameters.properties.resume_task_id, {
     type: "string",
     minLength: 1,
-    description: "Task ID returned by a timed-out or interrupted blocking send.",
+    description: "Task ID returned by a timed-out or interrupted blocking send. Resume with only the resolved canonical agent, this ID, and optional timeout_ms; never resend confirmed reachable work.",
   });
   const wait = pi.tools.find((tool) => tool.name === "a2a_wait_for_message");
   assert.ok(wait);
@@ -816,6 +820,11 @@ test("natural peer intent maps to automatic A2A delivery", async () => {
     assert.match(rules, /do not ask.*manual.*receiver/i);
     assert.match(rules, /never call.*a2a_wait_for_message.*(?:remain|stay) available/is);
     assert.match(rules, /automatic inbox.*idle/is);
+    assert.match(rules, /timeout.*does not cancel.*task/is);
+    assert.match(rules, /confirmed.*reachable.*(?:do not|never).*resend/is);
+    assert.match(rules, /resume_task_id.*resolved canonical/is);
+    assert.match(rules, /resume.*(?:only|omit).*(?:text|metadata|conversation_id|wait)/is);
+    assert.match(rules, /restart.*new.*(?:principal|identity).*rediscover/is);
   }
 });
 
@@ -1039,6 +1048,17 @@ test("send enforces exclusive new and resume modes before client I/O", async () 
   await pi.handlers.get("session_start")?.({} as never, value);
   assert.equal(starts, 1);
 
+  await assert.rejects(
+    send.execute(
+      "invalid-resume-fields",
+      { agent: "reviewer", resume_task_id: "task-1", wait: true },
+      undefined,
+      undefined,
+      value,
+    ),
+    /Remove text, metadata, conversation_id, and wait; resume with only agent, resume_task_id, and optional timeout_ms/,
+  );
+
   const invalid = [
     { agent: "reviewer" },
     { agent: "reviewer", text: "review", resume_task_id: "task-1" },
@@ -1050,7 +1070,7 @@ test("send enforces exclusive new and resume modes before client I/O", async () 
     const callCount: number = calls.length;
     await assert.rejects(
       send.execute("invalid", params, undefined, undefined, value),
-      /a2a_send_message requires exactly one of text or resume_task_id|a2a_send_message resume mode accepts only agent, resume_task_id, and timeout_ms/,
+      /a2a_send_message requires exactly one of text or resume_task_id|Remove text, metadata, conversation_id, and wait; resume with only agent, resume_task_id, and optional timeout_ms/,
     );
     assert.equal(calls.length, callCount);
   }
@@ -1231,6 +1251,9 @@ test("send renders unconfirmed and confirmed restart timeout identity", async ()
   assert.match(unconfirmedText.text, /Task confirmed: false/);
   assert.match(unconfirmedText.text, /Task reachable: false/);
   assert.match(unconfirmedText.text, /Recovery reason: broker_unavailable/);
+  assert.match(unconfirmedText.text, /delivery is not both confirmed and reachable/i);
+  assert.match(unconfirmedText.text, /do not.*blindly resend/i);
+  assert.doesNotMatch(unconfirmedText.text, /delivery remains confirmed and reachable/i);
   assert.match(confirmedText.text, /Task: task-confirmed/);
   assert.match(confirmedText.text, /Conversation: conversation-confirmed/);
   assert.match(confirmedText.text, /Resume task: task-confirmed/);
@@ -1238,6 +1261,12 @@ test("send renders unconfirmed and confirmed restart timeout identity", async ()
   assert.match(confirmedText.text, /Task confirmed: true/);
   assert.match(confirmedText.text, /Task reachable: true/);
   assert.match(confirmedText.text, /Recovery reason: deadline_expired/);
+  assert.match(confirmedText.text, /wait ended before a terminal reply/i);
+  assert.match(confirmedText.text, /delivery remains confirmed and reachable/i);
+  assert.match(confirmedText.text, /do not resend/i);
+  assert.match(confirmedText.text, /agent="reviewer"/i);
+  assert.match(confirmedText.text, /resume_task_id="task-confirmed"/i);
+  assert.match(confirmedText.text, /omit text, metadata, conversation_id, and wait/i);
 });
 
 test("send preserves a requested role and accepts its resolved canonical recovery identity", async () => {
@@ -1292,6 +1321,8 @@ test("send preserves a requested role and accepts its resolved canonical recover
   if (content?.type !== "text") return;
   assert.match(content.text, /Requested target: reviewer/);
   assert.match(content.text, /Resolved agent: reviewer-k7m2/);
+  assert.match(content.text, /agent="reviewer-k7m2"/);
+  assert.doesNotMatch(content.text, /agent="reviewer".*resume_task_id/s);
 });
 
 test("send rejects swapped requested targets and requires exact canonical identity on resume", async () => {
