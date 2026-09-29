@@ -1185,6 +1185,7 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             && !(record.state == InstallState::Removed
                 && record.install_kind == "managed"
                 && install_kind == "managed")
+            && !authenticated_managed_update_roots(record, &plugin_root, &install_kind)?
         {
             return Err(ManagedError::new(
                 "ownership_conflict",
@@ -1241,12 +1242,12 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
     let pointer = plugin_root.join("stable-bin-path");
     let prior_helper_snapshot = prior
         .as_ref()
-        .filter(|record| record.state != InstallState::Removed)
+        .filter(|record| record.state != InstallState::Removed && record.plugin_root == plugin_root)
         .map(|_| snapshot_owned_file(&helper, 0o700))
         .transpose()?;
     let prior_pointer_snapshot = prior
         .as_ref()
-        .filter(|record| record.state != InstallState::Removed)
+        .filter(|record| record.state != InstallState::Removed && record.plugin_root == plugin_root)
         .map(|_| snapshot_owned_file(&pointer, 0o600))
         .transpose()?;
     let prior_generation_snapshot = prior
@@ -1349,6 +1350,7 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
     }
     let same_assets = prior.as_ref().is_some_and(|record| {
         record.state != InstallState::Removed
+            && record.plugin_root == plugin_root
             && record.broker_digest == broker_digest
             && record.pi_package_digest == package_digest
             && record.stable_binary == generation.binary
@@ -5609,6 +5611,27 @@ fn managed_plugin_config_boundary(path: &Path) -> ManagedResult<PathBuf> {
         ));
     }
     Ok(config_root.unwrap().to_path_buf())
+}
+
+fn authenticated_managed_update_roots(
+    record: &OwnershipRecord,
+    current_root: &Path,
+    install_kind: &str,
+) -> ManagedResult<bool> {
+    if record.state == InstallState::Removed
+        || record.install_kind != "managed"
+        || install_kind != "managed"
+    {
+        return Ok(false);
+    }
+    let Ok(temporary_boundary) = managed_plugin_config_boundary(current_root) else {
+        return Ok(false);
+    };
+    let Ok(relocated_boundary) = managed_relocated_plugin_config_boundary(&record.plugin_root)
+    else {
+        return Ok(false);
+    };
+    Ok(temporary_boundary == relocated_boundary)
 }
 
 fn managed_relocated_plugin_config_boundary(path: &Path) -> ManagedResult<PathBuf> {

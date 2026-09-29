@@ -1872,6 +1872,70 @@ fn repair_adopts_the_exact_github_checkout_relocation_once() {
 }
 
 #[test]
+fn managed_update_accepts_the_next_authenticated_temporary_checkout() {
+    // Break caught: after Herdr relocates the first successful remote install, the next remote
+    // install runs from a fresh temporary checkout while the authenticated prior checkout still
+    // exists. Treating those roots as unrelated makes every managed update fail before mutation.
+    let fixture = ManagedFixture::new();
+    let first_temporary = fixture.transactional_plugin_root("first-123");
+    let first_bundle = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install_from_plugin_root(&first_bundle, &first_temporary));
+
+    let relocated_root = fixture
+        .base
+        .join("config/herdr/plugins/github/herdr.a2a-fixture/plugins/herdr");
+    fs::create_dir_all(relocated_root.parent().unwrap()).unwrap();
+    fs::rename(&first_temporary, &relocated_root).unwrap();
+    assert_success(
+        &fixture
+            .command()
+            .env("HERDR_A2A_PLUGIN_ROOT", &relocated_root)
+            .env("HERDR_A2A_TEST_HERDR_PLUGIN_ROOT", &relocated_root)
+            .args(["managed", "repair", "--startup"])
+            .output()
+            .unwrap(),
+    );
+    let prior_pointer = fs::read(relocated_root.join("stable-bin-path")).unwrap();
+
+    let second_temporary = fixture.transactional_plugin_root("second-456");
+    let second_bundle = fixture.bundle("1.0.1", "adapter two\n");
+    let update = fixture.install_from_plugin_root(&second_bundle, &second_temporary);
+    assert_success(&update);
+
+    let staged_record = fixture.record();
+    assert_eq!(
+        staged_record["plugin_root"],
+        second_temporary.to_str().unwrap()
+    );
+    assert_eq!(
+        staged_record["retained_generations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        fs::read(relocated_root.join("stable-bin-path")).unwrap(),
+        prior_pointer
+    );
+
+    fs::remove_dir_all(&relocated_root).unwrap();
+    fs::rename(&second_temporary, &relocated_root).unwrap();
+    let repaired = fixture
+        .command()
+        .env("HERDR_A2A_PLUGIN_ROOT", &relocated_root)
+        .env("HERDR_A2A_TEST_HERDR_PLUGIN_ROOT", &relocated_root)
+        .args(["managed", "repair", "--startup"])
+        .output()
+        .unwrap();
+    assert_success(&repaired);
+    assert_eq!(
+        fixture.record()["plugin_root"],
+        relocated_root.to_str().unwrap()
+    );
+}
+
+#[test]
 fn real_herdr_pi_event_adopts_the_relocated_managed_root() {
     // Break caught: Herdr serializes pane.agent_detected with data.agent as a string. Treating
     // that value as an object made event repair report success without adopting the final root.
@@ -2766,7 +2830,11 @@ fn retained_generation_tampering_fails_closed() {
     assert_success(&output);
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["state"], "Failed");
-    assert!(status["last_error"].as_str().unwrap().contains("modified"));
+    let last_error = status["last_error"].as_str().unwrap();
+    assert!(
+        last_error.contains("modified"),
+        "unexpected last_error: {last_error}"
+    );
 }
 
 #[test]
@@ -5456,7 +5524,7 @@ fn managed_plugin_root_hardens_group_writable_herdr_namespace() {
     fs::create_dir_all(&plugin_root).unwrap();
     fs::write(
         plugin_root.join("herdr-plugin.toml"),
-        b"version = \"0.1.12\"\n",
+        b"version = \"0.1.13\"\n",
     )
     .unwrap();
     fs::set_permissions(
@@ -7195,6 +7263,7 @@ fn append_nonzero_after_tar_end(archive: &Path) {
 
 fn copy_tree(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
+    fs::set_permissions(destination, fs::metadata(source).unwrap().permissions()).unwrap();
     for entry in fs::read_dir(source).unwrap() {
         let entry = entry.unwrap();
         let destination = destination.join(entry.file_name());
