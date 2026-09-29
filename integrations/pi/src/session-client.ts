@@ -298,7 +298,8 @@ export class SessionClient {
       this.#stdoutEndTimer = undefined;
       this.#fail(new Error("client session stdout ended unexpectedly"));
     }, this.#stdoutExitGraceMs);
-    this.#stdoutEndTimer.unref();
+    // Keep the bounded grace referenced: unresolved request promises do not keep Node alive,
+    // and this timer is the only path that rejects them when stdout closes before process exit.
   }
 
   #processFailure(
