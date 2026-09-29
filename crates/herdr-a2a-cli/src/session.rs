@@ -36,7 +36,7 @@ use crate::{
     doctor, managed,
     recovery::{
         BrokerConnection, CancellationSignal, ConnectionManager, ProductionRecoveryBackend,
-        RecoveryMode, RequestError, SessionIdentity, TaskOperation, TaskWaitMode,
+        RecoveryError, RecoveryMode, RequestError, SessionIdentity, TaskOperation, TaskWaitMode,
     },
     required_path, status,
     team::{AgentRegistrationWaiter, RegisteredTeamAgent, TeamOrchestrator, TeamRequest},
@@ -579,6 +579,8 @@ async fn execute_request(context: SessionContext, request: SessionRequest) -> Se
         Err(error) => {
             if let Some(acknowledgement) = error.downcast_ref::<AcknowledgementError>() {
                 SessionResponse::failure(id, "acknowledgement_failed", acknowledgement.to_string())
+            } else if let Some(recovery) = error.downcast_ref::<RecoveryError>() {
+                SessionResponse::failure(id, recovery.response_code(), recovery.to_string())
             } else if let Some(private) = error.downcast_ref::<PrivateBrokerError>()
                 && !private.candidates.is_empty()
             {

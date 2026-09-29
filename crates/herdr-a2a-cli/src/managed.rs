@@ -22,7 +22,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command};
 
-const OWNERSHIP_SCHEMA: u32 = 3;
+#[path = "managed/generation.rs"]
+mod generation;
+
+const LEGACY_OWNERSHIP_SCHEMA: u32 = 3;
+const OWNERSHIP_SCHEMA: u32 = 4;
 const OWNERSHIP_FILE: &str = "ownership.json";
 const INSTALL_LOCK: &str = "install.lock";
 const TRANSACTION_FILE: &str = "install-transaction.json";
@@ -81,6 +85,10 @@ impl ManagedError {
     fn io(code: &'static str, context: &str, error: io::Error) -> Self {
         Self::new(code, format!("{context}: {error}"))
     }
+
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
 }
 
 impl std::fmt::Display for ManagedError {
@@ -111,34 +119,70 @@ pub struct OwnedFile {
     mode: u32,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnershipRecord {
     schema_version: u32,
     state: InstallState,
     plugin_version: String,
+    protocol_major: u32,
     broker_digest: String,
     pi_package_digest: String,
     pi_package_source: PathBuf,
     pi_config_path: PathBuf,
     pi_package_entry: Value,
     purge_authority: bool,
-    #[serde(default, skip_serializing_if = "path_is_empty")]
     plugin_state_root: PathBuf,
     rescue_path: PathBuf,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     rescue_marker_digest: String,
     install_kind: String,
     plugin_root: PathBuf,
     stable_binary: PathBuf,
     ownership_path: PathBuf,
     owned_files: Vec<OwnedFile>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_generations: Vec<generation::GenerationAuthorization>,
     last_error: Option<String>,
 }
 
-fn path_is_empty(path: &Path) -> bool {
-    path.as_os_str().is_empty()
+impl Serialize for OwnershipRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut record = serializer.serialize_struct("OwnershipRecord", 22)?;
+        record.serialize_field("schema_version", &self.schema_version)?;
+        record.serialize_field("state", &self.state)?;
+        record.serialize_field("plugin_version", &self.plugin_version)?;
+        if self.schema_version == OWNERSHIP_SCHEMA {
+            record.serialize_field("protocol_major", &self.protocol_major)?;
+        }
+        record.serialize_field("broker_digest", &self.broker_digest)?;
+        record.serialize_field("pi_package_digest", &self.pi_package_digest)?;
+        record.serialize_field("pi_package_source", &self.pi_package_source)?;
+        record.serialize_field("pi_config_path", &self.pi_config_path)?;
+        record.serialize_field("pi_package_entry", &self.pi_package_entry)?;
+        record.serialize_field("purge_authority", &self.purge_authority)?;
+        if !self.plugin_state_root.as_os_str().is_empty() {
+            record.serialize_field("plugin_state_root", &self.plugin_state_root)?;
+        }
+        record.serialize_field("rescue_path", &self.rescue_path)?;
+        if !self.rescue_marker_digest.is_empty() {
+            record.serialize_field("rescue_marker_digest", &self.rescue_marker_digest)?;
+        }
+        record.serialize_field("install_kind", &self.install_kind)?;
+        record.serialize_field("plugin_root", &self.plugin_root)?;
+        record.serialize_field("stable_binary", &self.stable_binary)?;
+        record.serialize_field("ownership_path", &self.ownership_path)?;
+        record.serialize_field("owned_files", &self.owned_files)?;
+        if self.schema_version == OWNERSHIP_SCHEMA {
+            record.serialize_field("retained_generations", &self.retained_generations)?;
+        }
+        if let Some(last_error) = &self.last_error {
+            record.serialize_field("last_error", last_error)?;
+        }
+        record.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -147,6 +191,7 @@ struct CompatibleOwnershipRecord {
     schema_version: u32,
     state: InstallState,
     plugin_version: String,
+    protocol_major: Option<u32>,
     broker_digest: String,
     pi_package_digest: String,
     pi_package_source: PathBuf,
@@ -161,6 +206,7 @@ struct CompatibleOwnershipRecord {
     stable_binary: PathBuf,
     ownership_path: PathBuf,
     owned_files: Vec<OwnedFile>,
+    retained_generations: Option<Vec<generation::GenerationAuthorization>>,
     last_error: Option<String>,
 }
 
@@ -170,11 +216,46 @@ enum DecodedOwnershipSchema {
     AuthoritativeV2,
     LegacyV3Authority,
     CurrentV3,
+    CurrentV4,
 }
 
 fn classify_compatible_record(
     record: &CompatibleOwnershipRecord,
 ) -> ManagedResult<DecodedOwnershipSchema> {
+    if record.schema_version == OWNERSHIP_SCHEMA {
+        if record.protocol_major.is_none() || record.retained_generations.is_none() {
+            return Err(ManagedError::new(
+                "ownership_record_invalid",
+                "ownership generation catalog fields are incompatible",
+            ));
+        }
+        return match (
+            record.purge_authority,
+            record.plugin_state_root.as_ref(),
+            record.rescue_marker_digest.as_deref(),
+        ) {
+            (Some(false), None, Some(marker_digest)) if valid_digest(marker_digest) => {
+                Ok(DecodedOwnershipSchema::CurrentV4)
+            }
+            (Some(true), Some(root), Some(marker_digest))
+                if !root.as_os_str().is_empty() && valid_digest(marker_digest) =>
+            {
+                Ok(DecodedOwnershipSchema::CurrentV4)
+            }
+            _ => Err(ManagedError::new(
+                "ownership_record_invalid",
+                "ownership schema authority fields are incompatible",
+            )),
+        };
+    }
+    if record.schema_version == LEGACY_OWNERSHIP_SCHEMA
+        && (record.protocol_major.is_some() || record.retained_generations.is_some())
+    {
+        return Err(ManagedError::new(
+            "ownership_record_invalid",
+            "legacy ownership record contains generation catalog fields",
+        ));
+    }
     match (
         record.schema_version,
         record.purge_authority,
@@ -187,22 +268,22 @@ fn classify_compatible_record(
         {
             Ok(DecodedOwnershipSchema::AuthoritativeV2)
         }
-        (OWNERSHIP_SCHEMA, None, Some(root), Some(marker_digest))
+        (LEGACY_OWNERSHIP_SCHEMA, None, Some(root), Some(marker_digest))
             if !root.as_os_str().is_empty() && valid_digest(marker_digest) =>
         {
             Ok(DecodedOwnershipSchema::LegacyV3Authority)
         }
-        (OWNERSHIP_SCHEMA, Some(false), None, Some(marker_digest))
+        (LEGACY_OWNERSHIP_SCHEMA, Some(false), None, Some(marker_digest))
             if valid_digest(marker_digest) =>
         {
             Ok(DecodedOwnershipSchema::CurrentV3)
         }
-        (OWNERSHIP_SCHEMA, Some(true), Some(root), Some(marker_digest))
+        (LEGACY_OWNERSHIP_SCHEMA, Some(true), Some(root), Some(marker_digest))
             if !root.as_os_str().is_empty() && valid_digest(marker_digest) =>
         {
             Ok(DecodedOwnershipSchema::CurrentV3)
         }
-        (2, ..) | (OWNERSHIP_SCHEMA, ..) => Err(ManagedError::new(
+        (2, ..) | (LEGACY_OWNERSHIP_SCHEMA, ..) => Err(ManagedError::new(
             "ownership_record_invalid",
             "ownership schema authority fields are incompatible",
         )),
@@ -240,7 +321,7 @@ impl TryFrom<CompatibleOwnershipRecord> for OwnershipRecord {
                         .rescue_marker_digest
                         .expect("classified legacy authority marker digest is present"),
                 ),
-                DecodedOwnershipSchema::CurrentV3 => (
+                DecodedOwnershipSchema::CurrentV3 | DecodedOwnershipSchema::CurrentV4 => (
                     record
                         .purge_authority
                         .expect("classified authority is present"),
@@ -259,6 +340,9 @@ impl TryFrom<CompatibleOwnershipRecord> for OwnershipRecord {
             schema_version: record.schema_version,
             state: record.state,
             plugin_version: record.plugin_version,
+            protocol_major: record
+                .protocol_major
+                .unwrap_or(generation::MANAGED_PROTOCOL_MAJOR),
             broker_digest: record.broker_digest,
             pi_package_digest: record.pi_package_digest,
             pi_package_source: record.pi_package_source,
@@ -273,6 +357,7 @@ impl TryFrom<CompatibleOwnershipRecord> for OwnershipRecord {
             stable_binary: record.stable_binary,
             ownership_path: record.ownership_path,
             owned_files: record.owned_files,
+            retained_generations: record.retained_generations.unwrap_or_default(),
             last_error: record.last_error,
         })
     }
@@ -310,6 +395,15 @@ pub(crate) struct ManagedProcessEntry {
     pub executable_digest: String,
     pub control_port: u16,
     pub control_nonce: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Public crate interface for managed launch and diagnostics consumers.
+pub(crate) struct ManagedGenerationIdentity {
+    pub executable_path: PathBuf,
+    pub executable_digest: String,
+    pub protocol_major: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -785,7 +879,7 @@ where
     let record = Option::<CompatibleOwnershipRecord>::deserialize(deserializer)?;
     record
         .map(|mut record| {
-            if record.schema_version == OWNERSHIP_SCHEMA
+            if record.schema_version == LEGACY_OWNERSHIP_SCHEMA
                 && record.purge_authority.is_none()
                 && record.plugin_state_root.is_some()
                 && record.rescue_marker_digest.is_some()
@@ -1069,7 +1163,7 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
 
     let stable_root = stable_root()?;
     create_private_directory(&stable_root)?;
-    let mut install_lock = acquire_install_lock(&stable_root)?;
+    let install_lock = acquire_install_lock(&stable_root)?;
     reconcile_rescue_migration(&stable_root)?;
     reconcile_transaction(&stable_root).await?;
     if let Some(snapshot) = pi.as_mut() {
@@ -1129,23 +1223,11 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             && (record.broker_digest != broker_digest || record.pi_package_digest != package_digest)
     });
     if replacing_generation {
-        let record = prior.as_ref().unwrap();
-        let registered = read_process_registry(&stable_root, record)?;
-        let starting = read_starting_process_registry(&stable_root, record)?;
-        if !registered.is_empty() || !starting.is_empty() {
-            drop(install_lock);
-            drain_managed_processes(&stable_root, record).await?;
-            install_lock = acquire_install_lock(&stable_root)?;
-            if read_record_optional(&stable_root)? != prior
-                || !read_process_registry(&stable_root, record)?.is_empty()
-                || !read_starting_process_registry(&stable_root, record)?.is_empty()
-            {
-                return Err(ManagedError::new(
-                    "owned_process_mismatch",
-                    "managed installation changed during coordinated update stop",
-                ));
-            }
-        }
+        generation::ensure_retained_capacity(
+            prior
+                .as_ref()
+                .expect("replacing generation has a prior record"),
+        )?;
     }
     let _install_lock = install_lock;
     let (generation_directory, generation_files) = generation_plan(
@@ -1330,6 +1412,9 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             return rollback_transaction_error(&stable_root, error).await;
         }
     };
+    if let Some(prior) = prior.as_ref() {
+        retain_prior_generation_authorizations(&mut record, prior, replacing_generation)?;
+    }
     if let Some(snapshot) = pi {
         journal.phase = TransactionPhase::PiMutating;
         if let Err(error) = write_transaction(&stable_root, &journal) {
@@ -1414,14 +1499,6 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
         && let Err(error) = swap.commit()
     {
         eprintln!("herdr-a2a: installed assets committed; deferred backup cleanup: {error}");
-    }
-    if let Some(prior) = prior {
-        remove_superseded_generation(
-            &stable_root,
-            &prior,
-            &record,
-            journal.prior_generation_snapshot.as_ref(),
-        )?;
     }
     clear_transaction(&stable_root)?;
     print_state(&record.state);
@@ -2281,6 +2358,74 @@ pub(crate) fn unregister_managed_process(entry: &ManagedProcessEntry) -> Result<
     Ok(())
 }
 
+#[allow(dead_code)] // Public crate interface for managed launch and diagnostics consumers.
+pub(crate) fn managed_generation_identity(
+    executable: &Path,
+) -> ManagedResult<Option<ManagedGenerationIdentity>> {
+    if env::var_os("HERDR_A2A_PLUGIN_ROOT").is_none() {
+        return Ok(None);
+    }
+    let stable_root = stable_root()?;
+    validate_private_directory(&stable_root, 0o700)?;
+    let record = read_record(&stable_root)?;
+    validate_record(&record, &stable_root)?;
+    let executable_path = executable.canonicalize().map_err(|error| {
+        ManagedError::io(
+            "owned_process_mismatch",
+            "cannot resolve managed generation executable",
+            error,
+        )
+    })?;
+    let executable_digest = digest_file(&executable_path)?;
+    let authorization =
+        generation::authorize_executable(&record, &executable_path, &executable_digest)?;
+    let protocol_major = match authorization {
+        generation::AuthorizedGeneration::Current => record.protocol_major,
+        generation::AuthorizedGeneration::Retained(retained) => retained.protocol_major,
+    };
+    Ok(Some(ManagedGenerationIdentity {
+        executable_path,
+        executable_digest,
+        protocol_major,
+    }))
+}
+
+pub(crate) fn authorize_generation_transition(
+    running: &Path,
+    descriptor: &Path,
+) -> ManagedResult<()> {
+    if env::var_os("HERDR_A2A_PLUGIN_ROOT").is_none() {
+        return Err(ManagedError::new(
+            "owned_process_mismatch",
+            "generation transition is outside managed plugin context",
+        ));
+    }
+    let stable_root = stable_root()?;
+    validate_private_directory(&stable_root, 0o700)?;
+    let record = read_record(&stable_root)?;
+    validate_record(&record, &stable_root)?;
+    let resolve = |path: &Path| -> ManagedResult<(PathBuf, String)> {
+        let path = path.canonicalize().map_err(|error| {
+            ManagedError::io(
+                "owned_process_mismatch",
+                "cannot resolve managed generation executable",
+                error,
+            )
+        })?;
+        let digest = digest_file(&path)?;
+        Ok((path, digest))
+    };
+    let (running_path, running_digest) = resolve(running)?;
+    let (descriptor_path, descriptor_digest) = resolve(descriptor)?;
+    generation::authorize_transition(
+        &record,
+        &running_path,
+        &running_digest,
+        &descriptor_path,
+        &descriptor_digest,
+    )
+}
+
 fn validate_process_entry(
     entry: &ManagedProcessEntry,
     record: &OwnershipRecord,
@@ -2310,8 +2455,12 @@ fn validate_process_entry(
     if entry.coordinator_pid == 0
         || entry.broker_pid == 0
         || entry.control_port == 0
-        || entry.executable_path != record.stable_binary
-        || entry.executable_digest != record.broker_digest
+        || generation::authorize_executable(
+            record,
+            &entry.executable_path,
+            &entry.executable_digest,
+        )
+        .is_err()
         || entry.scope_key.len() != 64
         || entry.session_key.len() != 64
         || entry.executable_digest.len() != 64
@@ -2362,9 +2511,13 @@ fn validate_starting_process_entry(
     }
     if entry.coordinator_pid == 0
         || entry.control_port == 0
-        || entry.executable_path != record.stable_binary
-        || entry.executable_digest != record.broker_digest
-        || entry.expected_generation != expected_generation_for_record(record)?
+        || generation::authorize_executable(
+            record,
+            &entry.executable_path,
+            &entry.executable_digest,
+        )
+        .is_err()
+        || entry.expected_generation != generation_name(&entry.executable_path)?
         || entry.scope_key.len() != 64
         || entry.session_key.len() != 64
         || entry.executable_digest.len() != 64
@@ -2387,6 +2540,14 @@ fn validate_starting_process_entry(
     }
     if let Some(broker) = &entry.broker {
         validate_starting_broker_proof(broker, record)?;
+        if broker.executable_path != entry.executable_path
+            || broker.executable_digest != entry.executable_digest
+        {
+            return Err(ManagedError::new(
+                "owned_process_mismatch",
+                "starting coordinator and broker generations differ",
+            ));
+        }
     }
     Ok(())
 }
@@ -2410,8 +2571,12 @@ fn validate_starting_broker_proof(
         }
     }
     if broker.broker_pid == 0
-        || broker.executable_path != record.stable_binary
-        || broker.executable_digest != record.broker_digest
+        || generation::authorize_executable(
+            record,
+            &broker.executable_path,
+            &broker.executable_digest,
+        )
+        .is_err()
         || broker.executable_digest.len() != 64
         || !broker
             .executable_digest
@@ -2426,8 +2591,7 @@ fn validate_starting_broker_proof(
     Ok(())
 }
 
-fn expected_generation_for_record(record: &OwnershipRecord) -> ManagedResult<String> {
-    let binary = &record.stable_binary;
+fn generation_name(binary: &Path) -> ManagedResult<String> {
     let Some(bin) = binary.parent() else {
         return Err(ManagedError::new(
             "owned_process_mismatch",
@@ -2784,7 +2948,7 @@ async fn remove_exact_pi_entry(record: &OwnershipRecord) -> ManagedResult<()> {
 fn validate_removal_inventory(record: &OwnershipRecord, stable_root: &Path) -> ManagedResult<()> {
     validate_record_semantics(record, stable_root, &record.plugin_root)
         .map_err(|error| ManagedError::new("ownership_record_missing", error.to_string()))?;
-    for owned in &record.owned_files {
+    for owned in all_generation_owned_files(record) {
         match fs::symlink_metadata(&owned.path) {
             Ok(_) => {
                 validate_owned_file_digest(
@@ -2835,6 +2999,9 @@ fn remove_recorded_assets_except(
     retained: &BTreeSet<PathBuf>,
 ) -> ManagedResult<()> {
     let mut owned = record.owned_files.clone();
+    for generation in &record.retained_generations {
+        owned.extend(generation.owned_files.clone());
+    }
     owned.sort_by_key(|file| std::cmp::Reverse(file.path.components().count()));
     for file in owned {
         if !retained.contains(&file.path) {
@@ -2944,27 +3111,53 @@ fn unlink_recorded_owned_file(expected: &OwnedFile) -> ManagedResult<()> {
     })
 }
 
+fn all_generation_owned_files(record: &OwnershipRecord) -> Vec<&OwnedFile> {
+    record
+        .owned_files
+        .iter()
+        .chain(
+            record
+                .retained_generations
+                .iter()
+                .flat_map(|generation| generation.owned_files.iter()),
+        )
+        .collect()
+}
+
 fn removal_directories(
     record: &OwnershipRecord,
     stable_root: &Path,
 ) -> ManagedResult<Vec<PathBuf>> {
-    let generation = record.pi_package_source.parent().ok_or_else(|| {
+    let mut generation_roots = vec![record.pi_package_source.parent().ok_or_else(|| {
         ManagedError::new(
             "ownership_record_missing",
             "managed generation root is absent",
         )
-    })?;
+    })?];
+    for retained in &record.retained_generations {
+        generation_roots.push(retained.pi_package_source.parent().ok_or_else(|| {
+            ManagedError::new(
+                "ownership_record_missing",
+                "retained generation root is absent",
+            )
+        })?);
+    }
     let mut directories = BTreeSet::new();
-    directories.insert(generation.to_path_buf());
+    directories.extend(generation_roots.iter().map(|root| (*root).to_path_buf()));
     directories.insert(stable_root.join(RESCUE_DIRECTORY));
     directories.insert(record.plugin_root.join("libexec"));
-    for owned in &record.owned_files {
-        let mut parent = owned.path.parent();
-        while let Some(directory) = parent {
-            if directory == generation || directory.starts_with(generation) {
-                directories.insert(directory.to_path_buf());
-                parent = directory.parent();
-            } else {
+    for owned in all_generation_owned_files(record) {
+        for generation in &generation_roots {
+            if owned.path.starts_with(generation) {
+                let mut parent = owned.path.parent();
+                while let Some(directory) = parent {
+                    if directory == *generation || directory.starts_with(*generation) {
+                        directories.insert(directory.to_path_buf());
+                        parent = directory.parent();
+                    } else {
+                        break;
+                    }
+                }
                 break;
             }
         }
@@ -3114,6 +3307,28 @@ fn print_missing_status(json: bool) -> ManagedResult<()> {
     Ok(())
 }
 
+fn retain_prior_generation_authorizations(
+    record: &mut OwnershipRecord,
+    prior: &OwnershipRecord,
+    replacing_generation: bool,
+) -> ManagedResult<()> {
+    if prior.state == InstallState::Removed {
+        return Ok(());
+    }
+    record.retained_generations = prior.retained_generations.clone();
+    if replacing_generation {
+        let retained = generation::authorization_from_current(prior)?;
+        if !record
+            .retained_generations
+            .iter()
+            .any(|existing| existing.stable_binary == retained.stable_binary)
+        {
+            record.retained_generations.push(retained);
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the ownership record builder keeps each authenticated input explicit"
@@ -3149,6 +3364,7 @@ fn build_record(
         schema_version: OWNERSHIP_SCHEMA,
         state,
         plugin_version: read_plugin_version(plugin_root)?,
+        protocol_major: generation::MANAGED_PROTOCOL_MAJOR,
         broker_digest,
         pi_package_digest,
         pi_package_source: generation.package.clone(),
@@ -3163,6 +3379,7 @@ fn build_record(
         stable_binary: generation.binary.clone(),
         ownership_path: stable_root.join(OWNERSHIP_FILE),
         owned_files,
+        retained_generations: Vec::new(),
         last_error: None,
     })
 }
@@ -4457,7 +4674,7 @@ fn rescue_layout(record: &OwnershipRecord, stable_root: &Path) -> ManagedResult<
         (0o600, None) => Ok(RescueLayout::SourceNotice),
         (0o700, None) => Ok(RescueLayout::LegacyExecutable),
         (0o700, Some(helper))
-            if record.schema_version == OWNERSHIP_SCHEMA
+            if record.schema_version >= LEGACY_OWNERSHIP_SCHEMA
                 && helper.mode == 0o700
                 && helper.sha256 == record.broker_digest =>
         {
@@ -4500,9 +4717,12 @@ fn validate_record_inner(
     validate_purge_root: bool,
 ) -> ManagedResult<()> {
     validate_record_semantics(record, stable_root, &record.plugin_root)?;
+    generation::validate_catalog(record, stable_root)?;
     let rescue_layout = rescue_layout(record, stable_root)?;
-    if !matches!(record.schema_version, 2 | OWNERSHIP_SCHEMA)
-        || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
+    if !matches!(
+        record.schema_version,
+        2 | LEGACY_OWNERSHIP_SCHEMA | OWNERSHIP_SCHEMA
+    ) || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
         || record.rescue_path != stable_root.join("rescue/uninstall.sh")
         || !matches!(record.install_kind.as_str(), "managed" | "linked-dev")
     {
@@ -4671,8 +4891,10 @@ fn validate_record_semantics(
     stable_root: &Path,
     plugin_root: &Path,
 ) -> ManagedResult<()> {
-    if !matches!(record.schema_version, 2 | OWNERSHIP_SCHEMA)
-        || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
+    if !matches!(
+        record.schema_version,
+        2 | LEGACY_OWNERSHIP_SCHEMA | OWNERSHIP_SCHEMA
+    ) || record.ownership_path != stable_root.join(OWNERSHIP_FILE)
         || record.rescue_path != stable_root.join("rescue/uninstall.sh")
         || record.plugin_root != plugin_root
         || record.pi_config_path != pi_settings_path()?
@@ -4681,7 +4903,7 @@ fn validate_record_semantics(
         || record.plugin_version.len() > 128
         || !valid_digest(&record.broker_digest)
         || !valid_digest(&record.pi_package_digest)
-        || ((record.schema_version == OWNERSHIP_SCHEMA || record.purge_authority)
+        || ((record.schema_version >= LEGACY_OWNERSHIP_SCHEMA || record.purge_authority)
             && !valid_digest(&record.rescue_marker_digest))
         || (record.purge_authority && record.plugin_state_root.as_os_str().is_empty())
         || (!record.purge_authority && !record.plugin_state_root.as_os_str().is_empty())
@@ -4864,7 +5086,7 @@ fn validate_removed_record_for_reinstall(
         ));
     }
     validate_record_semantics(record, stable_root, &record.plugin_root)?;
-    for owned in &record.owned_files {
+    for owned in all_generation_owned_files(record) {
         match fs::symlink_metadata(&owned.path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -6928,12 +7150,16 @@ fn migrate_accepted_v2_record(
     stable_root: &Path,
     record: &mut OwnershipRecord,
 ) -> ManagedResult<()> {
-    if record.schema_version != 2 || !record.purge_authority {
+    let migratable = record.schema_version == LEGACY_OWNERSHIP_SCHEMA
+        || (record.schema_version == 2 && record.purge_authority);
+    if !migratable {
         return Ok(());
     }
     validate_record(record, stable_root)?;
     validate_pi_entry_if_present(record)?;
     record.schema_version = OWNERSHIP_SCHEMA;
+    record.protocol_major = generation::MANAGED_PROTOCOL_MAJOR;
+    record.retained_generations.clear();
     write_record(stable_root, record)
 }
 
@@ -8118,7 +8344,12 @@ async fn reconcile_transaction(stable_root: &Path) -> ManagedResult<()> {
         })?;
         validate_record(current, stable_root)?;
         cleanup_transaction_artifacts(&transaction)?;
-        if let Some(prior) = &transaction.prior_record {
+        if let Some(prior) = &transaction.prior_record
+            && !current
+                .retained_generations
+                .iter()
+                .any(|generation| generation.stable_binary == prior.stable_binary)
+        {
             remove_superseded_generation(
                 stable_root,
                 prior,
@@ -8179,6 +8410,7 @@ fn complete_predecessor_pi_mutated_transaction(
         prior.install_kind.clone(),
     )?;
     record.pi_package_entry = transaction.new_pi_entry.clone();
+    retain_prior_generation_authorizations(&mut record, prior, true)?;
     let expected_rescue = prepare_rescue_assets(stable_root, &plugin_root, &mut record)?;
     authenticate_published_rescue_assets(stable_root, &record, &expected_rescue)?;
     validate_record(&record, stable_root)?;
@@ -8222,6 +8454,7 @@ fn classify_legacy_pi_mutated_rescue_state(
         prior.install_kind.clone(),
     )?;
     record.pi_package_entry = transaction.new_pi_entry.clone();
+    retain_prior_generation_authorizations(&mut record, prior, true)?;
     let expected_new = prepare_rescue_assets(stable_root, &plugin_root, &mut record)?;
     let published_new =
         authenticate_published_rescue_assets(stable_root, &record, &expected_new).is_ok();
@@ -8332,7 +8565,12 @@ fn complete_predecessor_forward_commit(
     transaction.phase = TransactionPhase::RecordCommitted;
     write_transaction(stable_root, &transaction)?;
     cleanup_transaction_artifacts(&transaction)?;
-    if let Some(prior) = &transaction.prior_record {
+    if let Some(prior) = &transaction.prior_record
+        && !current
+            .retained_generations
+            .iter()
+            .any(|generation| generation.stable_binary == prior.stable_binary)
+    {
         remove_superseded_generation(
             stable_root,
             prior,
@@ -8568,6 +8806,7 @@ fn restore_predecessor_pi_mutating_rescue(
         InstallState::PiAdapterPending,
         prior.install_kind.clone(),
     )?;
+    retain_prior_generation_authorizations(&mut interrupted_record, prior, true)?;
     let interrupted_rescue =
         prepare_rescue_assets(stable_root, &plugin_root, &mut interrupted_record)?;
     authenticate_published_rescue_assets(stable_root, &interrupted_record, &interrupted_rescue)?;
@@ -10373,9 +10612,14 @@ mod descriptor_tree_tests {
             "ownership_path": "/stable/ownership.json",
             "owned_files": []
         });
-        if schema_version == OWNERSHIP_SCHEMA {
+        if schema_version >= LEGACY_OWNERSHIP_SCHEMA {
             value["plugin_state_root"] = serde_json::json!("/plugin-state");
             value["rescue_marker_digest"] = serde_json::json!("c".repeat(64));
+        }
+        if schema_version == OWNERSHIP_SCHEMA {
+            value["purge_authority"] = serde_json::json!(true);
+            value["protocol_major"] = serde_json::json!(generation::MANAGED_PROTOCOL_MAJOR);
+            value["retained_generations"] = serde_json::json!([]);
         }
         value
     }
@@ -10458,24 +10702,25 @@ mod descriptor_tree_tests {
     fn embedded_legacy_schema_v3_record_derives_its_recorded_purge_authority() {
         // Break caught: compatibility either rejects an exact old v3 journal or strips authority
         // that its authenticated state-root shape already established.
-        let record: OwnershipRecord = serde_json::from_value(predecessor_record(OWNERSHIP_SCHEMA))
-            .expect("legacy schema v3 must decode");
+        let record: OwnershipRecord =
+            serde_json::from_value(predecessor_record(LEGACY_OWNERSHIP_SCHEMA))
+                .expect("legacy schema v3 must decode");
         assert!(record.purge_authority);
         assert_eq!(record.plugin_state_root, Path::new("/plugin-state"));
     }
 
     #[test]
     fn embedded_legacy_schema_v3_record_rejects_incomplete_authority_shapes() {
-        let mut missing_root = predecessor_record(OWNERSHIP_SCHEMA);
+        let mut missing_root = predecessor_record(LEGACY_OWNERSHIP_SCHEMA);
         missing_root
             .as_object_mut()
             .expect("record is an object")
             .remove("plugin_state_root");
 
-        let mut empty_root = predecessor_record(OWNERSHIP_SCHEMA);
+        let mut empty_root = predecessor_record(LEGACY_OWNERSHIP_SCHEMA);
         empty_root["plugin_state_root"] = serde_json::json!("");
 
-        let mut invalid_marker = predecessor_record(OWNERSHIP_SCHEMA);
+        let mut invalid_marker = predecessor_record(LEGACY_OWNERSHIP_SCHEMA);
         invalid_marker["rescue_marker_digest"] = serde_json::json!("not-a-digest");
 
         for incompatible in [missing_root, empty_root, invalid_marker] {
@@ -11076,5 +11321,85 @@ mod schema_v2_migration_adjacency_tests {
             !source.contains(&forbidden),
             "product source must not expose a test-named executable identity override"
         );
+    }
+}
+
+#[cfg(test)]
+mod generation_process_tests {
+    use super::*;
+
+    fn record() -> OwnershipRecord {
+        let current = "a".repeat(32);
+        let retained = "b".repeat(32);
+        serde_json::from_value(serde_json::json!({
+            "schema_version": OWNERSHIP_SCHEMA,
+            "state": "Ready",
+            "plugin_version": "1.0.0",
+            "protocol_major": 1,
+            "broker_digest": "c".repeat(64),
+            "pi_package_digest": "d".repeat(64),
+            "pi_package_source": format!("/stable/generations/{current}/pi"),
+            "pi_config_path": "/pi/settings.json",
+            "pi_package_entry": format!("/stable/generations/{current}/pi"),
+            "purge_authority": false,
+            "rescue_path": "/stable/rescue/uninstall.sh",
+            "rescue_marker_digest": "e".repeat(64),
+            "install_kind": "managed",
+            "plugin_root": "/plugin",
+            "stable_binary": format!("/stable/generations/{current}/bin/herdr-a2a"),
+            "ownership_path": "/stable/ownership.json",
+            "owned_files": [],
+            "retained_generations": [{
+                "plugin_version": "0.9.0",
+                "protocol_major": 1,
+                "broker_digest": "f".repeat(64),
+                "pi_package_digest": "1".repeat(64),
+                "pi_package_source": format!("/stable/generations/{retained}/pi"),
+                "stable_binary": format!("/stable/generations/{retained}/bin/herdr-a2a"),
+                "owned_files": []
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn process(path: PathBuf, digest: String, scope: char) -> ManagedProcessEntry {
+        ManagedProcessEntry {
+            runtime_root: PathBuf::from("/runtime"),
+            session_key: "2".repeat(64),
+            workspace_id: format!("workspace-{scope}"),
+            scope_key: scope.to_string().repeat(64),
+            coordinator_pid: 1,
+            coordinator_start: "coordinator".to_owned(),
+            broker_pid: 2,
+            broker_start: "broker".to_owned(),
+            broker_instance_id: "instance".to_owned(),
+            executable_path: path,
+            executable_digest: digest,
+            control_port: 1,
+            control_nonce: "nonce".to_owned(),
+        }
+    }
+
+    #[test]
+    fn mixed_generation_process_entries_validate_against_their_own_identity() {
+        let record = record();
+        let current = process(
+            record.stable_binary.clone(),
+            record.broker_digest.clone(),
+            '3',
+        );
+        let retained = &record.retained_generations[0];
+        let retained = process(
+            retained.stable_binary.clone(),
+            retained.broker_digest.clone(),
+            '4',
+        );
+
+        assert!(validate_process_entry(&current, &record).is_ok());
+        assert!(validate_process_entry(&retained, &record).is_ok());
+
+        let mut tampered = retained;
+        tampered.executable_digest = record.broker_digest.clone();
+        assert!(validate_process_entry(&tampered, &record).is_err());
     }
 }

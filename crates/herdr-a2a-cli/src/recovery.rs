@@ -21,6 +21,7 @@ use crate::{
     DynError,
     coordinator::{BrokerLauncher, LaunchError},
     health::verify_broker_proof,
+    managed,
 };
 
 const REGISTRATION_HEADER: &str = "x-herdr-a2a-registration";
@@ -30,6 +31,15 @@ const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RECOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
 const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1_000];
 const RECOVERY_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn recovery_attempt_deadline(
+    now: tokio::time::Instant,
+    operation_deadline: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let attempt_deadline = now + RECOVERY_ATTEMPT_TIMEOUT;
+    operation_deadline.map_or(attempt_deadline, |deadline| deadline.min(attempt_deadline))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskWaitMode {
@@ -132,6 +142,7 @@ impl Default for CancellationSignal {
 pub(crate) enum RecoveryError {
     Unavailable(String),
     DescriptorInvalid(String),
+    GenerationIncompatible(String),
     ProofInvalid(String),
     RegistrationRejected(String),
     Deadline,
@@ -145,12 +156,29 @@ impl fmt::Display for RecoveryError {
             Self::DescriptorInvalid(reason) => {
                 write!(formatter, "runtime descriptor is invalid: {reason}")
             }
+            Self::GenerationIncompatible(reason) => {
+                write!(formatter, "managed generation is incompatible: {reason}")
+            }
             Self::ProofInvalid(reason) => write!(formatter, "broker proof is invalid: {reason}"),
             Self::RegistrationRejected(reason) => {
                 write!(formatter, "broker registration was rejected: {reason}")
             }
             Self::Deadline => formatter.write_str("broker recovery deadline expired"),
             Self::Shutdown => formatter.write_str("broker recovery stopped for shutdown"),
+        }
+    }
+}
+
+impl RecoveryError {
+    pub(crate) fn response_code(&self) -> &'static str {
+        match self {
+            Self::Deadline => "recovery_timeout",
+            Self::GenerationIncompatible(_) => "generation_incompatible",
+            Self::Unavailable(_)
+            | Self::DescriptorInvalid(_)
+            | Self::ProofInvalid(_)
+            | Self::RegistrationRejected(_)
+            | Self::Shutdown => "recovery_unavailable",
         }
     }
 }
@@ -213,13 +241,14 @@ impl ConnectionManager {
         shutdown: CancellationSignal,
     ) -> Result<Arc<Self>, RecoveryError> {
         let mut identity = identity;
+        let deadline = recovery_attempt_deadline(backend.now(), None);
         let connection = establish(
             &identity,
             backend.as_ref(),
             launcher.as_ref(),
             &shutdown,
             None,
-            None,
+            Some(deadline),
             None,
         )
         .await?;
@@ -244,8 +273,10 @@ impl ConnectionManager {
         mode: RecoveryMode,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Arc<BrokerConnection>, RecoveryError> {
-        let _gate = self.lock_recovery(deadline).await?;
-        self.recover_locked(observed, mode, deadline, None).await
+        let deadline = recovery_attempt_deadline(self.backend.now(), deadline);
+        let _gate = self.lock_recovery(Some(deadline)).await?;
+        self.recover_locked(observed, mode, Some(deadline), None)
+            .await
     }
 
     async fn lock_recovery(
@@ -335,6 +366,7 @@ impl ConnectionManager {
         observed_instance_id: &str,
         deadline: tokio::time::Instant,
     ) -> Result<Option<Arc<BrokerConnection>>, RecoveryError> {
+        let deadline = recovery_attempt_deadline(self.backend.now(), Some(deadline));
         let _gate = self.lock_recovery(Some(deadline)).await?;
         let installed = self.current().await;
         if installed.descriptor.broker_instance_id != observed_instance_id {
@@ -513,9 +545,16 @@ fn validate_recovered_descriptor(
         ));
     }
     if descriptor.executable_path != identity.executable {
-        return Err(RecoveryError::DescriptorInvalid(
-            "executable identity changed during recovery".to_owned(),
-        ));
+        managed::authorize_generation_transition(&identity.executable, &descriptor.executable_path)
+            .map_err(|error| {
+                if error.code() == "generation_incompatible" {
+                    RecoveryError::GenerationIncompatible(error.to_string())
+                } else {
+                    RecoveryError::DescriptorInvalid(
+                        "executable identity changed during recovery".to_owned(),
+                    )
+                }
+            })?;
     }
     Ok(())
 }
@@ -758,8 +797,8 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        BrokerConnection, CancellationSignal, ConnectionManager, RecoveryBackend, RecoveryError,
-        RecoveryMode, SessionIdentity,
+        BrokerConnection, CancellationSignal, ConnectionManager, RECOVERY_ATTEMPT_TIMEOUT,
+        RecoveryBackend, RecoveryError, RecoveryMode, SessionIdentity, recovery_attempt_deadline,
     };
     use crate::coordinator::{BrokerLauncher, LaunchError};
 
@@ -977,6 +1016,40 @@ mod tests {
         fn jitter_percent(&self) -> u8 {
             0
         }
+    }
+
+    #[test]
+    fn recovery_attempt_uses_the_earlier_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            recovery_attempt_deadline(now, Some(now + Duration::from_secs(3))),
+            now + Duration::from_secs(3)
+        );
+        assert_eq!(
+            recovery_attempt_deadline(now, Some(now + Duration::from_secs(60))),
+            now + Duration::from_secs(10)
+        );
+        assert_eq!(
+            recovery_attempt_deadline(now, None),
+            now + Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn recovery_errors_have_stable_session_response_codes() {
+        assert_eq!(RecoveryError::Deadline.response_code(), "recovery_timeout");
+        assert_eq!(
+            RecoveryError::Unavailable("offline".to_owned()).response_code(),
+            "recovery_unavailable"
+        );
+        assert_eq!(
+            RecoveryError::DescriptorInvalid("changed".to_owned()).response_code(),
+            "recovery_unavailable"
+        );
+        assert_eq!(
+            RecoveryError::GenerationIncompatible("protocol".to_owned()).response_code(),
+            "generation_incompatible"
+        );
     }
 
     #[test]
@@ -1562,27 +1635,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbounded_recovery_stops_only_on_shutdown() {
-        // Break caught: omitted deadlines impose a hidden retry limit or miss a cancellation wake.
+    async fn omitted_deadline_waiting_for_inbox_recovery_gate_times_out() {
+        // Break caught: list_agents waits forever while the automatic inbox owns recovery.
         let executable = identity().executable;
         let first = connection(FIRST_INSTANCE, &executable);
         let backend = Arc::new(ScriptedBackend::new(
             vec![first.descriptor.clone()],
             vec![first],
         ));
-        let shutdown = CancellationSignal::new();
-        let manager = connected(backend, shutdown.clone()).await;
-        let recovering = tokio::spawn({
-            let manager = manager.clone();
-            async move { manager.recover_replacement(FIRST_INSTANCE, None).await }
-        });
-        tokio::task::yield_now().await;
+        let manager = connected(backend.clone(), CancellationSignal::new()).await;
+        let held_by_inbox = manager.recovery_gate.lock().await;
+        let started = backend.current_time();
 
-        shutdown.cancel();
+        let result = manager.recover_replacement(FIRST_INSTANCE, None).await;
 
-        assert!(matches!(
-            recovering.await.unwrap(),
-            Err(RecoveryError::Shutdown)
+        assert!(matches!(result, Err(RecoveryError::Deadline)));
+        assert_eq!(backend.current_time(), started + RECOVERY_ATTEMPT_TIMEOUT);
+        drop(held_by_inbox);
+    }
+
+    #[tokio::test]
+    async fn omitted_operation_deadline_still_bounds_recovery_attempt() {
+        // Break caught: a request omits its operation deadline and waits forever behind an inbox
+        // recovery holding the shared gate.
+        let executable = identity().executable;
+        let first = connection(FIRST_INSTANCE, &executable);
+        let backend = Arc::new(ScriptedBackend::new(
+            vec![first.descriptor.clone()],
+            vec![first],
         ));
+        let manager = connected(backend.clone(), CancellationSignal::new()).await;
+        let started = backend.current_time();
+
+        let result = manager.recover_replacement(FIRST_INSTANCE, None).await;
+
+        assert!(matches!(result, Err(RecoveryError::Deadline)));
+        assert_eq!(backend.current_time(), started + RECOVERY_ATTEMPT_TIMEOUT);
+        assert!(manager.recovery_gate.try_lock().is_ok());
     }
 }

@@ -288,9 +288,10 @@ impl ManagedDoctorFixture {
         fs::write(
             &ownership,
             serde_json::to_vec(&json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "state": "Ready",
                 "plugin_version": record_version,
+                "protocol_major": 1,
                 "broker_digest": file_digest(&stable_binary),
                 "pi_package_digest": tree_digest(&package),
                 "pi_package_source": package,
@@ -303,7 +304,8 @@ impl ManagedDoctorFixture {
                 "plugin_root": plugin_root,
                 "stable_binary": stable_binary,
                 "ownership_path": ownership,
-                "owned_files": owned_files
+                "owned_files": owned_files,
+                "retained_generations": []
             }))
             .unwrap(),
         )

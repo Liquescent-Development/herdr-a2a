@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 
-const OWNERSHIP_SCHEMA: u64 = 3;
+const OWNERSHIP_SCHEMA: u64 = 4;
 // Managed debug executables can spend about 46 seconds in macOS dyld/Gatekeeper before main,
 // and that latency grows under a long serialized suite. Keep a generous test-only envelope so
 // host load cannot masquerade as a lifecycle failure; production deadlines are unchanged.
@@ -1423,7 +1423,13 @@ esac
                     .unwrap()
                     .cmp(right["path"].as_str().unwrap())
             });
+        record["schema_version"] = json!(3);
         record.as_object_mut().unwrap().remove("purge_authority");
+        record.as_object_mut().unwrap().remove("protocol_major");
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("retained_generations");
         fs::write(
             self.ownership_path(),
             serde_json::to_vec_pretty(&record).unwrap(),
@@ -2218,7 +2224,7 @@ fn managed_remove_accepts_exact_round2_schema_v3_rescue_helper_inventory() {
 }
 
 #[test]
-fn managed_update_migrates_schema_v2_to_v3_without_executable_backup_code() {
+fn managed_update_migrates_schema_v2_to_v4_without_executable_backup_code() {
     // Break caught: update either rejects v2 or publishes an unauthenticated backup executable.
     let fixture = ManagedFixture::new();
     let first = fixture.bundle("1.0.0", "adapter one\n");
@@ -2230,7 +2236,7 @@ fn managed_update_migrates_schema_v2_to_v3_without_executable_backup_code() {
 
     assert_success(&output);
     let record = fixture.record();
-    assert_eq!(record["schema_version"], 3);
+    assert_eq!(record["schema_version"], OWNERSHIP_SCHEMA);
     assert_eq!(record["purge_authority"], false);
     assert!(
         !fixture
@@ -2553,6 +2559,8 @@ fn authority_bearing_schema_v2_records_migrate_without_losing_purge_authority() 
     let historical_record = fixture.record();
     let mut migrated_historical_record = historical_record.clone();
     migrated_historical_record["schema_version"] = json!(OWNERSHIP_SCHEMA);
+    migrated_historical_record["protocol_major"] = json!(1);
+    migrated_historical_record["retained_generations"] = json!([]);
     let historical_pi = fs::read(fixture.pi_agent_dir.join("settings.json")).unwrap();
     let incompatible = fixture.repair();
     assert_failure_code(&incompatible, "incompatible_version");
@@ -2674,6 +2682,91 @@ fn authority_bearing_schema_v2_records_migrate_without_losing_purge_authority() 
     assert!(!interrupted.status.success());
     assert_eq!(fixture.record()["schema_version"], OWNERSHIP_SCHEMA);
     assert_success(&fixture.repair());
+}
+
+#[test]
+fn ownership_v3_migrates_to_generation_catalog() {
+    // Break caught: a valid single-generation installation becomes unreadable when schema v4 is
+    // introduced, or migration accidentally moves non-generation ownership into retained state.
+    let fixture = ManagedFixture::new();
+    let bundle = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install(&bundle));
+    let mut legacy = fixture.record();
+    legacy["schema_version"] = json!(3);
+    legacy.as_object_mut().unwrap().remove("protocol_major");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("retained_generations");
+    fs::write(
+        fixture.ownership_path(),
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(fixture.ownership_path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_success(&fixture.repair());
+
+    let migrated = fixture.record();
+    assert_eq!(migrated["schema_version"], OWNERSHIP_SCHEMA);
+    assert_eq!(migrated["protocol_major"], 1);
+    assert_eq!(migrated["retained_generations"], json!([]));
+    assert_eq!(migrated["owned_files"], legacy["owned_files"]);
+}
+
+#[test]
+fn retained_generation_tampering_fails_closed() {
+    let fixture = ManagedFixture::new();
+    let bundle = fixture.bundle("1.0.0", "adapter one\n");
+    assert_success(&fixture.install(&bundle));
+    let mut record = fixture.record();
+    let current_pi = PathBuf::from(record["pi_package_source"].as_str().unwrap());
+    let current_root = current_pi.parent().unwrap();
+    let retained_root = fixture.stable_root().join("generations/retained-fixture");
+    copy_tree(current_root, &retained_root);
+    let retained_pi = retained_root.join("pi");
+    let retained_binary = retained_root.join("bin/herdr-a2a");
+    let retained_owned = record["owned_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|owned| {
+            let path = PathBuf::from(owned["path"].as_str().unwrap());
+            path.strip_prefix(current_root).ok().map(|relative| {
+                let mut owned = owned.clone();
+                owned["path"] = json!(retained_root.join(relative));
+                owned
+            })
+        })
+        .collect::<Vec<_>>();
+    record["retained_generations"] = json!([{
+        "plugin_version": record["plugin_version"].clone(),
+        "protocol_major": 1,
+        "broker_digest": record["broker_digest"].clone(),
+        "pi_package_digest": record["pi_package_digest"].clone(),
+        "pi_package_source": retained_pi,
+        "stable_binary": retained_binary,
+        "owned_files": retained_owned,
+    }]);
+    fs::write(
+        fixture.ownership_path(),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(fixture.ownership_path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_success(&fixture.status_json());
+    fs::write(
+        retained_root.join("pi/extensions/herdr-a2a.ts"),
+        "tampered retained adapter\n",
+    )
+    .unwrap();
+
+    let output = fixture.status_json();
+    assert_success(&output);
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["state"], "Failed");
+    assert!(status["last_error"].as_str().unwrap().contains("modified"));
 }
 
 #[test]
@@ -2931,7 +3024,7 @@ fn schema_v2_update_cannot_launder_an_ambient_directory_into_purge_authority() {
         .output()
         .unwrap();
     assert_success(&migrated);
-    assert_eq!(fixture.record()["schema_version"], 3);
+    assert_eq!(fixture.record()["schema_version"], OWNERSHIP_SCHEMA);
     assert_eq!(fixture.record()["purge_authority"], false);
     assert!(fixture.record().get("plugin_state_root").is_none());
 
@@ -3713,14 +3806,22 @@ fn managed_remove_reconciles_an_authenticated_fully_retired_registration() {
 }
 
 #[test]
-fn managed_update_stops_registered_workspace_before_replacing_generation() {
-    // Break caught: update deleted the old generation while its registered broker remained live,
-    // leaving a process registry that the new ownership record could never authenticate.
+fn managed_update_retains_live_workspace_and_prior_generation() {
+    // Break caught: update drains a healthy old workspace or deletes adapter and skill resources
+    // still referenced by its long-lived Pi process.
     let fixture = ManagedFixture::new();
     let first = fixture.bundle("1.0.0", "adapter one\n");
     let second = fixture.bundle("2.0.0", "adapter two\n");
     assert_success(&fixture.install(&first));
-    let first_binary = PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap());
+    let first_record = fixture.record();
+    let first_binary = PathBuf::from(first_record["stable_binary"].as_str().unwrap());
+    let first_generation = first_binary
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let original_skill = fs::read(first_generation.join("pi/skills/herdr-a2a/SKILL.md")).unwrap();
     let runtime = fixture.base.join("runtime update");
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3754,31 +3855,67 @@ fn managed_update_stops_registered_workspace_before_replacing_generation() {
     );
 
     let update = fixture.install(&second);
-    let exit_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < exit_deadline && child.try_wait().unwrap().is_none() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let exited = child.try_wait().unwrap().is_some();
-    if !exited {
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
 
     assert_success(&update);
     assert!(
-        exited,
-        "managed update left the old registered broker alive"
+        child.try_wait().unwrap().is_none(),
+        "managed update drained the old broker"
+    );
+    assert!(
+        first_binary.exists(),
+        "managed update deleted the prior binary"
     );
     assert_eq!(
-        fs::read_to_string(&registry).unwrap_or_default(),
-        "HERDR_A2A_PROCESS_REGISTRY_V1\n",
-        "managed update retained a stale process registration"
+        fs::read(first_generation.join("pi/skills/herdr-a2a/SKILL.md")).unwrap(),
+        original_skill
     );
+    assert!(
+        fs::read_to_string(&registry)
+            .unwrap_or_default()
+            .contains("workspace-update"),
+        "managed update deleted the live process registration"
+    );
+    let updated = fixture.record();
     assert_ne!(
-        PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap()),
+        PathBuf::from(updated["stable_binary"].as_str().unwrap()),
         first_binary,
         "managed update did not publish the replacement generation"
     );
+    assert_eq!(updated["retained_generations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        updated["retained_generations"][0]["stable_binary"],
+        first_record["stable_binary"]
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn managed_remove_deletes_current_and_retained_generations() {
+    let fixture = ManagedFixture::new();
+    let first = fixture.bundle("1.0.0", "adapter one\n");
+    let second = fixture.bundle("2.0.0", "adapter two\n");
+    assert_success(&fixture.install(&first));
+    let first_root = PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert_success(&fixture.install(&second));
+    let second_root = PathBuf::from(fixture.record()["stable_binary"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fixture.herdr().set_unregister_success_and_plugin_absent();
+
+    assert_success(&fixture.remove(false, false));
+
+    assert!(!first_root.exists());
+    assert!(!second_root.exists());
 }
 
 #[test]
@@ -3804,6 +3941,11 @@ fn starting_process_operation_boundary_matrix_covers_all_release_cases() {
             case.expect_broker == (case.boundary != "after-coordinator-reservation")
         })
     );
+    assert!(
+        cases
+            .iter()
+            .all(|case| case.expect_retired == (case.operation == "remove"))
+    );
     let real_cases = cases
         .iter()
         .filter(|case| case.real_process)
@@ -3826,6 +3968,7 @@ struct StartingProcessLifecycleCase {
     operation: &'static str,
     boundary: &'static str,
     expect_broker: bool,
+    expect_retired: bool,
     real_process: bool,
     real_test: &'static str,
 }
@@ -3836,27 +3979,31 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
             operation: "update",
             boundary: "after-coordinator-reservation",
             expect_broker: false,
+            expect_retired: false,
             real_process: true,
-            real_test: "starting_process_update_coordinator_reservation_is_retired_with_watchdog",
+            real_test: "starting_process_update_coordinator_reservation_is_preserved_with_watchdog",
         },
         StartingProcessLifecycleCase {
             operation: "update",
             boundary: "after-broker-proof-before-descriptor",
             expect_broker: true,
+            expect_retired: false,
             real_process: true,
-            real_test: "starting_process_update_broker_proof_before_descriptor_is_retired_with_watchdog",
+            real_test: "starting_process_update_broker_proof_before_descriptor_is_preserved_with_watchdog",
         },
         StartingProcessLifecycleCase {
             operation: "update",
             boundary: "after-descriptor-before-registration",
             expect_broker: true,
+            expect_retired: false,
             real_process: true,
-            real_test: "starting_process_update_descriptor_before_registration_is_retired_with_watchdog",
+            real_test: "starting_process_update_descriptor_before_registration_is_preserved_with_watchdog",
         },
         StartingProcessLifecycleCase {
             operation: "remove",
             boundary: "after-coordinator-reservation",
             expect_broker: false,
+            expect_retired: true,
             real_process: true,
             real_test: "starting_process_remove_coordinator_reservation_is_retired_with_watchdog",
         },
@@ -3864,6 +4011,7 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
             operation: "remove",
             boundary: "after-broker-proof-before-descriptor",
             expect_broker: true,
+            expect_retired: true,
             real_process: true,
             real_test: "starting_process_remove_broker_proof_before_descriptor_is_retired_with_watchdog",
         },
@@ -3871,6 +4019,7 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
             operation: "remove",
             boundary: "after-descriptor-before-registration",
             expect_broker: true,
+            expect_retired: true,
             real_process: true,
             real_test: "starting_process_remove_descriptor_before_registration_is_retired_with_watchdog",
         },
@@ -3878,7 +4027,7 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
 }
 
 #[test]
-fn starting_process_update_coordinator_reservation_is_retired_with_watchdog() {
+fn starting_process_update_coordinator_reservation_is_preserved_with_watchdog() {
     let operation = "update";
     let boundary = "after-coordinator-reservation";
     eprintln!("starting-process case={operation}/{boundary} phase=setup");
@@ -3892,17 +4041,17 @@ fn starting_process_update_coordinator_reservation_is_retired_with_watchdog() {
     let output = fixture.run_lifecycle_operation_with_watchdog(operation, &second, boundary);
 
     assert_success(&output);
-    children.assert_exact_coordinator_and_broker_retired();
-    fixture.assert_no_starting_or_registered_entry();
+    children.assert_exact_coordinator_and_broker_live();
+    children.retire_for_fixture();
     record_starting_process_case_execution(
-        "starting_process_update_coordinator_reservation_is_retired_with_watchdog",
+        "starting_process_update_coordinator_reservation_is_preserved_with_watchdog",
     );
 }
 
 #[test]
-fn starting_process_is_retired_before_binding_during_update_and_remove() {
-    // Break caught: removing any operation/boundary pair silently drops one of the release
-    // obligations. The named aggregate must execute every distinct watchdog proof below.
+fn starting_process_lifecycle_is_generation_aware_during_update_and_remove() {
+    // Break caught: removing any operation/boundary pair silently drops either an update
+    // continuity proof or a removal release obligation. The aggregate executes every case.
     let cases = starting_process_operation_boundary_matrix();
     assert_eq!(cases.len(), 6);
     assert!(cases.iter().any(|case| case.operation == "update"));
@@ -4052,7 +4201,8 @@ fn run_starting_process_case_aggregate_with_config(
     let aggregate_deadline = aggregate_started + config.aggregate_watchdog;
     for case in cases.iter().filter(|case| case.real_process) {
         assert_ne!(
-            case.real_test, "starting_process_is_retired_before_binding_during_update_and_remove",
+            case.real_test,
+            "starting_process_lifecycle_is_generation_aware_during_update_and_remove",
             "the aggregate must never recursively invoke itself"
         );
         let started = Instant::now();
@@ -4309,7 +4459,7 @@ fn record_starting_process_timeout_ready(children: &PausedStartingChildren) {
 }
 
 #[test]
-fn starting_process_update_broker_proof_before_descriptor_is_retired_with_watchdog() {
+fn starting_process_update_broker_proof_before_descriptor_is_preserved_with_watchdog() {
     run_real_starting_process_case(
         starting_process_operation_boundary_matrix()
             .into_iter()
@@ -4360,7 +4510,7 @@ fn starting_process_remove_broker_proof_before_descriptor_is_retired_with_watchd
 }
 
 #[test]
-fn starting_process_update_descriptor_before_registration_is_retired_with_watchdog() {
+fn starting_process_update_descriptor_before_registration_is_preserved_with_watchdog() {
     run_real_starting_process_case(
         starting_process_operation_boundary_matrix()
             .into_iter()
@@ -4413,8 +4563,13 @@ fn run_real_starting_process_case(case: StartingProcessLifecycleCase) {
             fixture.pi_log(),
         );
     }
-    children.assert_exact_coordinator_and_broker_retired();
-    fixture.assert_no_starting_or_registered_entry();
+    if case.expect_retired {
+        children.assert_exact_coordinator_and_broker_retired();
+        fixture.assert_no_starting_or_registered_entry();
+    } else {
+        children.assert_exact_coordinator_and_broker_live();
+        children.retire_for_fixture();
+    }
     record_starting_process_case_execution(case.real_test);
 }
 
@@ -4817,15 +4972,26 @@ fn pre_round3_install_journal_with_legacy_v3_record_recovers_exactly() {
     assert!(!interrupted.status.success());
     let journal_path = fixture.stable_root().join("install-transaction.json");
     let mut journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
-    journal["prior_record"]
-        .as_object_mut()
-        .unwrap()
-        .remove("purge_authority");
-    if let Some(record) = journal["new_record"].as_object_mut() {
+    if let Some(record) = journal["prior_record"].as_object_mut() {
+        record.insert("schema_version".to_owned(), json!(3));
         record.remove("purge_authority");
+        record.remove("protocol_major");
+        record.remove("retained_generations");
+    }
+    if let Some(record) = journal["new_record"].as_object_mut() {
+        record.insert("schema_version".to_owned(), json!(3));
+        record.remove("purge_authority");
+        record.remove("protocol_major");
+        record.remove("retained_generations");
     }
     fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
     fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        fixture.ownership_path(),
+        serde_json::to_vec_pretty(&journal["prior_record"]).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(fixture.ownership_path(), fs::Permissions::from_mode(0o600)).unwrap();
 
     assert_success(&fixture.repair());
     assert_eq!(fs::read(fixture.ownership_path()).unwrap(), prior_record);
