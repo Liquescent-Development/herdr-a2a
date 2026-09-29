@@ -1412,24 +1412,8 @@ async fn install_inner(bundle: &Path) -> ManagedResult<()> {
             return rollback_transaction_error(&stable_root, error).await;
         }
     };
-    if let Some(prior) = prior
-        .as_ref()
-        .filter(|prior| prior.state != InstallState::Removed)
-    {
-        record.retained_generations = prior.retained_generations.clone();
-    }
-    if replacing_generation {
-        let prior = prior
-            .as_ref()
-            .expect("replacing generation has a prior record");
-        let retained = generation::authorization_from_current(prior)?;
-        if !record
-            .retained_generations
-            .iter()
-            .any(|existing| existing.stable_binary == retained.stable_binary)
-        {
-            record.retained_generations.push(retained);
-        }
+    if let Some(prior) = prior.as_ref() {
+        retain_prior_generation_authorizations(&mut record, prior, replacing_generation)?;
     }
     if let Some(snapshot) = pi {
         journal.phase = TransactionPhase::PiMutating;
@@ -3319,6 +3303,28 @@ fn print_missing_status(json: bool) -> ManagedResult<()> {
         );
     } else {
         println!("failed: not installed");
+    }
+    Ok(())
+}
+
+fn retain_prior_generation_authorizations(
+    record: &mut OwnershipRecord,
+    prior: &OwnershipRecord,
+    replacing_generation: bool,
+) -> ManagedResult<()> {
+    if prior.state == InstallState::Removed {
+        return Ok(());
+    }
+    record.retained_generations = prior.retained_generations.clone();
+    if replacing_generation {
+        let retained = generation::authorization_from_current(prior)?;
+        if !record
+            .retained_generations
+            .iter()
+            .any(|existing| existing.stable_binary == retained.stable_binary)
+        {
+            record.retained_generations.push(retained);
+        }
     }
     Ok(())
 }
@@ -8404,6 +8410,7 @@ fn complete_predecessor_pi_mutated_transaction(
         prior.install_kind.clone(),
     )?;
     record.pi_package_entry = transaction.new_pi_entry.clone();
+    retain_prior_generation_authorizations(&mut record, prior, true)?;
     let expected_rescue = prepare_rescue_assets(stable_root, &plugin_root, &mut record)?;
     authenticate_published_rescue_assets(stable_root, &record, &expected_rescue)?;
     validate_record(&record, stable_root)?;
@@ -8447,6 +8454,7 @@ fn classify_legacy_pi_mutated_rescue_state(
         prior.install_kind.clone(),
     )?;
     record.pi_package_entry = transaction.new_pi_entry.clone();
+    retain_prior_generation_authorizations(&mut record, prior, true)?;
     let expected_new = prepare_rescue_assets(stable_root, &plugin_root, &mut record)?;
     let published_new =
         authenticate_published_rescue_assets(stable_root, &record, &expected_new).is_ok();
@@ -8798,6 +8806,7 @@ fn restore_predecessor_pi_mutating_rescue(
         InstallState::PiAdapterPending,
         prior.install_kind.clone(),
     )?;
+    retain_prior_generation_authorizations(&mut interrupted_record, prior, true)?;
     let interrupted_rescue =
         prepare_rescue_assets(stable_root, &plugin_root, &mut interrupted_record)?;
     authenticate_published_rescue_assets(stable_root, &interrupted_record, &interrupted_rescue)?;

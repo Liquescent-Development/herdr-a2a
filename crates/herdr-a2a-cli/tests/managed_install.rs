@@ -3941,6 +3941,11 @@ fn starting_process_operation_boundary_matrix_covers_all_release_cases() {
             case.expect_broker == (case.boundary != "after-coordinator-reservation")
         })
     );
+    assert!(
+        cases
+            .iter()
+            .all(|case| case.expect_retired == (case.operation == "remove"))
+    );
     let real_cases = cases
         .iter()
         .filter(|case| case.real_process)
@@ -3963,6 +3968,7 @@ struct StartingProcessLifecycleCase {
     operation: &'static str,
     boundary: &'static str,
     expect_broker: bool,
+    expect_retired: bool,
     real_process: bool,
     real_test: &'static str,
 }
@@ -3973,27 +3979,31 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
             operation: "update",
             boundary: "after-coordinator-reservation",
             expect_broker: false,
+            expect_retired: false,
             real_process: true,
-            real_test: "starting_process_update_coordinator_reservation_is_retired_with_watchdog",
+            real_test: "starting_process_update_coordinator_reservation_is_preserved_with_watchdog",
         },
         StartingProcessLifecycleCase {
             operation: "update",
             boundary: "after-broker-proof-before-descriptor",
             expect_broker: true,
+            expect_retired: false,
             real_process: true,
-            real_test: "starting_process_update_broker_proof_before_descriptor_is_retired_with_watchdog",
+            real_test: "starting_process_update_broker_proof_before_descriptor_is_preserved_with_watchdog",
         },
         StartingProcessLifecycleCase {
             operation: "update",
             boundary: "after-descriptor-before-registration",
             expect_broker: true,
+            expect_retired: false,
             real_process: true,
-            real_test: "starting_process_update_descriptor_before_registration_is_retired_with_watchdog",
+            real_test: "starting_process_update_descriptor_before_registration_is_preserved_with_watchdog",
         },
         StartingProcessLifecycleCase {
             operation: "remove",
             boundary: "after-coordinator-reservation",
             expect_broker: false,
+            expect_retired: true,
             real_process: true,
             real_test: "starting_process_remove_coordinator_reservation_is_retired_with_watchdog",
         },
@@ -4001,6 +4011,7 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
             operation: "remove",
             boundary: "after-broker-proof-before-descriptor",
             expect_broker: true,
+            expect_retired: true,
             real_process: true,
             real_test: "starting_process_remove_broker_proof_before_descriptor_is_retired_with_watchdog",
         },
@@ -4008,6 +4019,7 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
             operation: "remove",
             boundary: "after-descriptor-before-registration",
             expect_broker: true,
+            expect_retired: true,
             real_process: true,
             real_test: "starting_process_remove_descriptor_before_registration_is_retired_with_watchdog",
         },
@@ -4015,7 +4027,7 @@ fn starting_process_operation_boundary_matrix() -> [StartingProcessLifecycleCase
 }
 
 #[test]
-fn starting_process_update_coordinator_reservation_is_retired_with_watchdog() {
+fn starting_process_update_coordinator_reservation_is_preserved_with_watchdog() {
     let operation = "update";
     let boundary = "after-coordinator-reservation";
     eprintln!("starting-process case={operation}/{boundary} phase=setup");
@@ -4029,17 +4041,17 @@ fn starting_process_update_coordinator_reservation_is_retired_with_watchdog() {
     let output = fixture.run_lifecycle_operation_with_watchdog(operation, &second, boundary);
 
     assert_success(&output);
-    children.assert_exact_coordinator_and_broker_retired();
-    fixture.assert_no_starting_or_registered_entry();
+    children.assert_exact_coordinator_and_broker_live();
+    children.retire_for_fixture();
     record_starting_process_case_execution(
-        "starting_process_update_coordinator_reservation_is_retired_with_watchdog",
+        "starting_process_update_coordinator_reservation_is_preserved_with_watchdog",
     );
 }
 
 #[test]
-fn starting_process_is_retired_before_binding_during_update_and_remove() {
-    // Break caught: removing any operation/boundary pair silently drops one of the release
-    // obligations. The named aggregate must execute every distinct watchdog proof below.
+fn starting_process_lifecycle_is_generation_aware_during_update_and_remove() {
+    // Break caught: removing any operation/boundary pair silently drops either an update
+    // continuity proof or a removal release obligation. The aggregate executes every case.
     let cases = starting_process_operation_boundary_matrix();
     assert_eq!(cases.len(), 6);
     assert!(cases.iter().any(|case| case.operation == "update"));
@@ -4189,7 +4201,8 @@ fn run_starting_process_case_aggregate_with_config(
     let aggregate_deadline = aggregate_started + config.aggregate_watchdog;
     for case in cases.iter().filter(|case| case.real_process) {
         assert_ne!(
-            case.real_test, "starting_process_is_retired_before_binding_during_update_and_remove",
+            case.real_test,
+            "starting_process_lifecycle_is_generation_aware_during_update_and_remove",
             "the aggregate must never recursively invoke itself"
         );
         let started = Instant::now();
@@ -4446,7 +4459,7 @@ fn record_starting_process_timeout_ready(children: &PausedStartingChildren) {
 }
 
 #[test]
-fn starting_process_update_broker_proof_before_descriptor_is_retired_with_watchdog() {
+fn starting_process_update_broker_proof_before_descriptor_is_preserved_with_watchdog() {
     run_real_starting_process_case(
         starting_process_operation_boundary_matrix()
             .into_iter()
@@ -4497,7 +4510,7 @@ fn starting_process_remove_broker_proof_before_descriptor_is_retired_with_watchd
 }
 
 #[test]
-fn starting_process_update_descriptor_before_registration_is_retired_with_watchdog() {
+fn starting_process_update_descriptor_before_registration_is_preserved_with_watchdog() {
     run_real_starting_process_case(
         starting_process_operation_boundary_matrix()
             .into_iter()
@@ -4550,8 +4563,13 @@ fn run_real_starting_process_case(case: StartingProcessLifecycleCase) {
             fixture.pi_log(),
         );
     }
-    children.assert_exact_coordinator_and_broker_retired();
-    fixture.assert_no_starting_or_registered_entry();
+    if case.expect_retired {
+        children.assert_exact_coordinator_and_broker_retired();
+        fixture.assert_no_starting_or_registered_entry();
+    } else {
+        children.assert_exact_coordinator_and_broker_live();
+        children.retire_for_fixture();
+    }
     record_starting_process_case_execution(case.real_test);
 }
 
