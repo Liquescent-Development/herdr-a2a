@@ -3041,6 +3041,8 @@ fn remove_recorded_assets_except(
     Ok(())
 }
 
+// libc stat field widths differ across supported Unix targets.
+#[allow(clippy::useless_conversion)]
 fn unlink_recorded_owned_file(expected: &OwnedFile) -> ManagedResult<()> {
     match fs::symlink_metadata(&expected.path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
