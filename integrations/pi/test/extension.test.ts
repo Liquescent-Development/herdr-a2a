@@ -22,6 +22,10 @@ process.env.HERDR_WORKSPACE_ID = "test-workspace";
 const execFileAsync = promisify(execFile);
 
 type Handler = (event: never, context: ExtensionContext) => unknown;
+type CompatibleToolContext = ExtensionContext & {
+  readonly tools: readonly never[];
+  executeTool(...args: unknown[]): Promise<never>;
+};
 
 class FakePi {
   readonly tools: ToolDefinition[] = [];
@@ -65,7 +69,11 @@ function context(
       getSystemPrompt: () => systemPrompt,
       isIdle: () => idle,
       ui: { notify: (message: string, kind?: string) => notifications.push([message, kind]) },
-    } as unknown as ExtensionContext,
+      tools: [],
+      executeTool: async (..._args: unknown[]): Promise<never> => {
+        throw new Error("unexpected nested tool execution in extension test");
+      },
+    } as unknown as CompatibleToolContext,
   };
 }
 
