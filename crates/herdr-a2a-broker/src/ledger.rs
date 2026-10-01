@@ -398,6 +398,7 @@ impl BrokerPersistence for SqliteTaskStore {
         &self,
         batch: PersistenceBatch,
     ) -> Result<PersistenceCommitOutcome, DomainError> {
+        let deleted_task_ids = batch.delete_task_ids.clone();
         let encoded = batch
             .upsert_tasks
             .iter()
@@ -567,6 +568,9 @@ impl BrokerPersistence for SqliteTaskStore {
         })
             .await
             .map_err(|_| DomainError::PersistenceUnavailable)?;
+        if ledger_outcome == PersistenceCommitOutcome::Complete {
+            self.retire_sdk_projection_admissions(&deleted_task_ids);
+        }
         let projection_outcome = self
             .apply_pending_projections()
             .await
@@ -1115,6 +1119,45 @@ fn decode_durable_task(row: StoredTaskRow) -> Result<DurableTask, StoreError> {
     };
     validate_durable_for_store(&task)?;
     Ok(task)
+}
+
+pub(crate) fn clean_authoritative_projection(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<(DurableTask, String), StoreError> {
+    if connection
+        .query_row(
+            "SELECT 1 FROM projection_outbox WHERE task_id = ?1",
+            [task_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(invalid("task projection reconciliation is pending"));
+    }
+    let row = stored_task_row(connection, task_id)?
+        .ok_or_else(|| invalid("task projection has no retained ledger task"))?;
+    if row.legacy_quarantined != 0 {
+        return Err(invalid("task projection references a quarantined task"));
+    }
+    let durable = decode_durable_task(row)?;
+    let expected_version = i64::try_from(durable.state_version)
+        .map_err(|_| invalid("ledger state version exceeds SQLite integer range"))?;
+    let expected_json = projection_json(&durable)?;
+    let stored = connection
+        .query_row(
+            "SELECT version, task_json FROM tasks WHERE task_id = ?1",
+            [task_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if stored.as_ref() != Some(&(expected_version, expected_json.clone())) {
+        return Err(invalid(
+            "task projection differs from the authoritative retained ledger",
+        ));
+    }
+    Ok((durable, expected_json))
 }
 
 fn projection_json(task: &DurableTask) -> Result<String, StoreError> {
@@ -2235,6 +2278,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_executor_projection_admissions_are_independently_consumed() {
+        // Break caught: two emissions of the same exact projection collapse to one map entry, so
+        // the second legitimate SDK persistence is rejected after the durable task advances.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-identical", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+
+        BrokerPersistence::commit(
+            &store,
+            batch(durable("sdk-identical", 3, DurableTaskState::Acknowledged)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(store.create(emitted.clone()).await.unwrap(), 3);
+        assert_eq!(store.create(emitted.clone()).await.unwrap(), 3);
+        let replay = store.create(emitted).await.unwrap_err();
+        assert_eq!(replay.message, super::PROJECTION_NOT_AUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn one_projection_admission_authorizes_only_one_concurrent_persistence() {
+        // Break caught: consumption happens after releasing the database lock, allowing two SDK
+        // persistence calls to observe and reuse the same one-shot admission.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-one-shot", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+        BrokerPersistence::commit(
+            &store,
+            batch(durable("sdk-one-shot", 3, DurableTaskState::Acknowledged)),
+        )
+        .await
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut calls = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let emitted = emitted.clone();
+            let barrier = barrier.clone();
+            calls.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store.create(emitted).await
+            }));
+        }
+        barrier.wait().await;
+        let mut success = 0;
+        let mut unauthorized = 0;
+        for call in calls {
+            match call.await.unwrap() {
+                Ok(version) => {
+                    assert_eq!(version, 3);
+                    success += 1;
+                }
+                Err(error) => {
+                    assert_eq!(error.message, super::PROJECTION_NOT_AUTHORIZED);
+                    unauthorized += 1;
+                }
+            }
+        }
+        assert_eq!((success, unauthorized), (1, 1));
+    }
+
+    #[tokio::test]
     async fn concurrent_executor_projection_admissions_are_independently_consumed() {
         // Break caught: a second executor emission for the same task replaces the first exact
         // admission, so the first SDK persistence is rejected after both become stale.
@@ -2264,6 +2382,105 @@ mod tests {
         assert_eq!(store.create(submitted).await.unwrap(), 3);
         assert_eq!(store.update(working).await.unwrap(), 3);
         assert_eq!(store.get("sdk-concurrent").await.unwrap(), Some(retained));
+    }
+
+    #[tokio::test]
+    async fn superseded_projection_does_not_mask_pending_newer_outbox() {
+        // Break caught: version 1 is admitted, tasks contains version 2, and a failed version-3
+        // projection remains in the outbox. Reporting version 2 as authoritative masks required
+        // reconciliation with the durable ledger at version 3.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-pending", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+        BrokerPersistence::commit(
+            &store,
+            batch(durable("sdk-pending", 2, DurableTaskState::Leased)),
+        )
+        .await
+        .unwrap();
+        block_projection(&store);
+        assert_eq!(
+            BrokerPersistence::commit(
+                &store,
+                batch(durable("sdk-pending", 3, DurableTaskState::Acknowledged,)),
+            )
+            .await
+            .unwrap(),
+            PersistenceCommitOutcome::ReconciliationRequired
+        );
+        unblock_projection(&store);
+
+        let error = store.create(emitted).await.unwrap_err();
+        assert_eq!(error.message, super::PROJECTION_NOT_AUTHORIZED);
+        assert_eq!(
+            store
+                .test_i64("SELECT version FROM tasks WHERE task_id='sdk-pending'")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .test_i64("SELECT state_version FROM projection_outbox WHERE task_id='sdk-pending'")
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn task_pruning_removes_projection_admissions_before_id_reuse() {
+        // Break caught: pruning durable state leaves a process-local admission associated with a
+        // task ID, allowing it to outlive the durable task incarnation.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-pruned", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+        assert_eq!(store.pending_sdk_projection_admissions(), 1);
+
+        BrokerPersistence::commit(
+            &store,
+            PersistenceBatch {
+                registration_epoch_high_watermark: None,
+                upsert_tasks: Vec::new(),
+                delete_task_ids: vec!["sdk-pruned".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(store.pending_sdk_projection_admissions(), 0);
+
+        let mut replacement = durable("sdk-pruned", 1, DurableTaskState::Queued);
+        replacement.context_id = "replacement-context".to_owned();
+        replacement.created_unix_ms = NOW + 100;
+        replacement.delivery_deadline_unix_ms = NOW + 100 + DELIVERY_TTL_MS;
+        BrokerPersistence::commit(&store, batch(replacement.clone()))
+            .await
+            .unwrap();
+        let mut replacement_ack = durable("sdk-pruned", 3, DurableTaskState::Acknowledged);
+        replacement_ack.context_id = replacement.context_id;
+        replacement_ack.created_unix_ms = replacement.created_unix_ms;
+        replacement_ack.delivery_deadline_unix_ms = replacement.delivery_deadline_unix_ms;
+        replacement_ack
+            .lease
+            .as_mut()
+            .expect("acknowledged fixture has a lease")
+            .leased_until_unix_ms = NOW + 100 + 60_000;
+        replacement_ack.acknowledged_unix_ms = Some(NOW + 101);
+        BrokerPersistence::commit(&store, batch(replacement_ack))
+            .await
+            .unwrap();
+
+        let replay = store.create(emitted).await.unwrap_err();
+        assert_eq!(replay.message, super::PROJECTION_NOT_AUTHORIZED);
     }
 
     #[tokio::test]
