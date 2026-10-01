@@ -38,6 +38,9 @@ const MAX_SDK_PROJECTION_ADMISSIONS: usize = MAX_RETAINED_TASKS;
 type ProjectionFingerprint = [u8; 32];
 type SdkProjectionAdmissions = Arc<Mutex<SdkProjectionAdmissionRegistry>>;
 
+#[cfg(test)]
+type LedgerCommitHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TaskIncarnation {
     context_id: String,
@@ -243,6 +246,8 @@ pub struct SqliteTaskStore {
     identity_store: IdentityStore,
     sdk_projection_admissions: SdkProjectionAdmissions,
     #[cfg(test)]
+    ledger_commit_hook: Arc<Mutex<Option<LedgerCommitHook>>>,
+    #[cfg(test)]
     allow_uncoordinated_sdk_writes: bool,
 }
 
@@ -314,6 +319,8 @@ impl SqliteTaskStore {
                 SdkProjectionAdmissionRegistry::default(),
             )),
             #[cfg(test)]
+            ledger_commit_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             allow_uncoordinated_sdk_writes: false,
         })
     }
@@ -328,6 +335,26 @@ impl SqliteTaskStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .total
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_one_shot_ledger_commit_hook(&self, hook: LedgerCommitHook) {
+        *self
+            .ledger_commit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_one_shot_ledger_commit_hook(&self) {
+        let hook = self
+            .ledger_commit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     #[cfg(test)]

@@ -398,7 +398,7 @@ impl BrokerPersistence for SqliteTaskStore {
         &self,
         batch: PersistenceBatch,
     ) -> Result<PersistenceCommitOutcome, DomainError> {
-        let deleted_task_ids = batch.delete_task_ids.clone();
+        let admission_store = self.clone();
         let encoded = batch
             .upsert_tasks
             .iter()
@@ -564,13 +564,13 @@ impl BrokerPersistence for SqliteTaskStore {
                 }
             }
             transaction.commit()?;
+            #[cfg(test)]
+            admission_store.run_one_shot_ledger_commit_hook();
+            admission_store.retire_sdk_projection_admissions(&batch.delete_task_ids);
             Ok(PersistenceCommitOutcome::Complete)
         })
             .await
             .map_err(|_| DomainError::PersistenceUnavailable)?;
-        if ledger_outcome == PersistenceCommitOutcome::Complete {
-            self.retire_sdk_projection_admissions(&deleted_task_ids);
-        }
         let projection_outcome = self
             .apply_pending_projections()
             .await
@@ -1145,14 +1145,36 @@ pub(crate) fn clean_authoritative_projection(
     let expected_version = i64::try_from(durable.state_version)
         .map_err(|_| invalid("ledger state version exceeds SQLite integer range"))?;
     let expected_json = projection_json(&durable)?;
+    let expected_projection: Task = serde_json::from_str(&expected_json)
+        .map_err(|_| invalid("ledger task projection cannot be decoded"))?;
+    let expected = TaskColumns::from_task(&expected_projection)
+        .map_err(|_| invalid("ledger task projection cannot be encoded"))?;
     let stored = connection
         .query_row(
-            "SELECT version, task_json FROM tasks WHERE task_id = ?1",
+            "SELECT context_id, state, status_timestamp, version, task_json
+             FROM tasks WHERE task_id = ?1",
             [task_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
         )
         .optional()?;
-    if stored.as_ref() != Some(&(expected_version, expected_json.clone())) {
+    let is_authoritative = stored.is_some_and(
+        |(context_id, state, status_timestamp, version, task_json)| {
+            context_id == expected.context_id
+                && state == expected.state
+                && status_timestamp == expected.status_timestamp
+                && version == expected_version
+                && task_json == expected.task_json
+        },
+    );
+    if !is_authoritative {
         return Err(invalid(
             "task projection differs from the authoritative retained ledger",
         ));
@@ -1323,7 +1345,7 @@ fn invalid(message: impl Into<String>) -> StoreError {
 mod tests {
     use std::path::PathBuf;
     use std::sync::{
-        Arc,
+        Arc, Barrier as StdBarrier,
         atomic::{AtomicI64, Ordering},
     };
 
@@ -2432,6 +2454,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_projection_rejects_corrupted_index_columns() {
+        // Break caught: authoritative JSON and version masked corrupt list/filter columns, so an
+        // admitted stale projection was reported as successfully superseded without clean state.
+        for (suffix, corruption) in [
+            ("context", "context_id = 'corrupt-context'"),
+            ("state", "state = 'TASK_STATE_COMPLETED'"),
+            ("timestamp", "status_timestamp = '2099-01-01T00:00:00.000Z'"),
+        ] {
+            let store = SqliteTaskStore::open(":memory:").unwrap();
+            store.prepare_startup(NOW).await.unwrap();
+            let task_id = format!("sdk-corrupt-{suffix}");
+            let queued = durable(&task_id, 1, DurableTaskState::Queued);
+            BrokerPersistence::commit(&store, batch(queued.clone()))
+                .await
+                .unwrap();
+            let emitted: a2a::Task =
+                serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+            store.authorize_sdk_projection(&emitted).await.unwrap();
+            BrokerPersistence::commit(
+                &store,
+                batch(durable(&task_id, 3, DurableTaskState::Acknowledged)),
+            )
+            .await
+            .unwrap();
+            let corrupt_task_id = task_id.clone();
+            store
+                .run_blocking(move |connection| {
+                    connection
+                        .execute(
+                            &format!("UPDATE tasks SET {corruption} WHERE task_id = ?1"),
+                            [&corrupt_task_id],
+                        )
+                        .map_err(|_| super::database_error())?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            let error = store.create(emitted).await.unwrap_err();
+            assert_eq!(error.message, super::PROJECTION_NOT_AUTHORIZED, "{suffix}");
+        }
+    }
+
+    #[tokio::test]
     async fn task_pruning_removes_projection_admissions_before_id_reuse() {
         // Break caught: pruning durable state leaves a process-local admission associated with a
         // task ID, allowing it to outlive the durable task incarnation.
@@ -2481,6 +2547,106 @@ mod tests {
 
         let replay = store.create(emitted).await.unwrap_err();
         assert_eq!(replay.message, super::PROJECTION_NOT_AUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_retires_admissions_before_identical_incarnation_reuse() {
+        // Break caught: the SQLite transaction released the DB mutex before deleting process-local
+        // admissions, allowing identical task incarnation reuse to race into the cleanup gap.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-delete-race", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+
+        let hook_entered = Arc::new(StdBarrier::new(2));
+        let hook_release = Arc::new(StdBarrier::new(2));
+        let entered_from_hook = hook_entered.clone();
+        let release_from_hook = hook_release.clone();
+        store.set_one_shot_ledger_commit_hook(Arc::new(move || {
+            entered_from_hook.wait();
+            release_from_hook.wait();
+        }));
+        let deleting_store = store.clone();
+        let deletion = tokio::spawn(async move {
+            BrokerPersistence::commit(
+                &deleting_store,
+                PersistenceBatch {
+                    registration_epoch_high_watermark: None,
+                    upsert_tasks: Vec::new(),
+                    delete_task_ids: vec!["sdk-delete-race".to_owned()],
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || hook_entered.wait())
+            .await
+            .unwrap();
+
+        let replacement_store = store.clone();
+        let replacement = queued.clone();
+        let mut replacing = tokio::spawn(async move {
+            BrokerPersistence::commit(&replacement_store, batch(replacement)).await
+        });
+        let raced =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut replacing).await;
+        let replacement_blocked = raced.is_err();
+        if let Ok(result) = raced {
+            result.unwrap().unwrap();
+            store.authorize_sdk_projection(&emitted).await.unwrap();
+        }
+        tokio::task::spawn_blocking(move || hook_release.wait())
+            .await
+            .unwrap();
+        deletion.await.unwrap().unwrap();
+        if replacement_blocked {
+            replacing.await.unwrap().unwrap();
+            store.authorize_sdk_projection(&emitted).await.unwrap();
+        }
+
+        assert_eq!(store.pending_sdk_projection_admissions(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_required_rolls_back_mixed_batch_deletions_and_cleanup() {
+        // A version-suppressed mismatching upsert returns before SQLite commit, so deletions and
+        // their process-local admission cleanup must both remain unapplied.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let deleted = durable("sdk-mixed-delete", 1, DurableTaskState::Queued);
+        let retained = durable("sdk-mixed-retained", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(
+            &store,
+            PersistenceBatch {
+                registration_epoch_high_watermark: None,
+                upsert_tasks: vec![deleted.clone(), retained.clone()],
+                delete_task_ids: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&deleted).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+        let mut mismatched = retained;
+        mismatched.context_id = "different-context".to_owned();
+
+        let outcome = BrokerPersistence::commit(
+            &store,
+            PersistenceBatch {
+                registration_epoch_high_watermark: None,
+                upsert_tasks: vec![mismatched],
+                delete_task_ids: vec![deleted.task_id.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, PersistenceCommitOutcome::ReconciliationRequired);
+        assert!(store.get(&deleted.task_id).await.unwrap().is_some());
+        assert_eq!(store.pending_sdk_projection_admissions(), 1);
     }
 
     #[tokio::test]
