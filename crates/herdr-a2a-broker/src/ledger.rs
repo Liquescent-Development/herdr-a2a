@@ -17,6 +17,7 @@ use crate::store::{
 };
 
 const SCHEMA_VERSION: i64 = 1;
+pub(crate) const PROJECTION_NOT_AUTHORIZED: &str = "task projection is not authorized";
 const DELIVERY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const DELIVERY_LEASE_MS: i64 = 60_000;
 
@@ -295,12 +296,12 @@ pub(crate) fn apply_authorized_projection(
                 .ok()
                 .filter(|version| *version > 0)
                 .ok_or_else(|| invalid("stored task version is invalid")),
-            _ => Err(invalid("task projection is not authorized")),
+            _ => Err(invalid(PROJECTION_NOT_AUTHORIZED)),
         };
     };
     validate_outbox_entry(transaction, &columns.task_id, state_version, &task_json)?;
     if task_json != columns.task_json {
-        return Err(invalid("task projection is not authorized"));
+        return Err(invalid(PROJECTION_NOT_AUTHORIZED));
     }
     transaction.execute(
         "INSERT INTO tasks (
@@ -2205,6 +2206,64 @@ mod tests {
             "replied"
         );
         assert_eq!(store.get("sdk-stale").await.unwrap(), Some(retained));
+    }
+
+    #[tokio::test]
+    async fn exact_executor_projection_superseded_after_emission_is_a_noop() {
+        // Break caught: the executor emits an authorized Submitted projection, the recipient
+        // acknowledges the task before the SDK persists that event, and the successful send is
+        // reported as "task projection is not authorized" even though version 3 is authoritative.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-superseded", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+
+        let acknowledged = durable("sdk-superseded", 3, DurableTaskState::Acknowledged);
+        BrokerPersistence::commit(&store, batch(acknowledged.clone()))
+            .await
+            .unwrap();
+        let retained = store.get("sdk-superseded").await.unwrap().unwrap();
+
+        assert_eq!(store.create(emitted.clone()).await.unwrap(), 3);
+        assert_eq!(store.get("sdk-superseded").await.unwrap(), Some(retained));
+        let replay = store.create(emitted).await.unwrap_err();
+        assert_eq!(replay.message, "task projection is not authorized");
+    }
+
+    #[tokio::test]
+    async fn concurrent_executor_projection_admissions_are_independently_consumed() {
+        // Break caught: a second executor emission for the same task replaces the first exact
+        // admission, so the first SDK persistence is rejected after both become stale.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-concurrent", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let submitted: a2a::Task =
+            serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&submitted).await.unwrap();
+
+        let leased = durable("sdk-concurrent", 2, DurableTaskState::Leased);
+        BrokerPersistence::commit(&store, batch(leased))
+            .await
+            .unwrap();
+        let working = store.get("sdk-concurrent").await.unwrap().unwrap();
+        store.authorize_sdk_projection(&working).await.unwrap();
+
+        let acknowledged = durable("sdk-concurrent", 3, DurableTaskState::Acknowledged);
+        BrokerPersistence::commit(&store, batch(acknowledged))
+            .await
+            .unwrap();
+        let retained = store.get("sdk-concurrent").await.unwrap().unwrap();
+
+        assert_eq!(store.create(submitted).await.unwrap(), 3);
+        assert_eq!(store.update(working).await.unwrap(), 3);
+        assert_eq!(store.get("sdk-concurrent").await.unwrap(), Some(retained));
     }
 
     #[tokio::test]

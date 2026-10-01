@@ -4168,6 +4168,97 @@ async fn working_final_get_returns_reachable_stream_lost_without_waiting_for_rep
 }
 
 #[tokio::test]
+async fn nonblocking_send_inspects_exact_task_after_post_commit_application_error() {
+    // Break caught: a broker error returned after durable task creation is reported as a failed
+    // send, hiding the stable task ID and inviting a duplicate assignment.
+    let runtime = TestBrokerRuntime::new();
+    let broker = runtime.start_broker().await;
+    broker.add_agent("implementer", "w1:p1").await;
+    broker.add_agent("reviewer", "w1:p2").await;
+    let mut sender = ClientSessionProcess::spawn(&broker, "w1:p1", "pi-session-1").await;
+    let mut recipient = ClientSessionProcess::spawn(&broker, "w1:p2", "pi-session-2").await;
+    await_client_pair_ready(&mut sender, &mut recipient).await;
+    recipient
+        .send(json!({"id":"delivery","method":"wait_for_message","params":{"timeout_ms":5_000}}))
+        .await;
+    broker
+        .fail_jsonrpc_response_after_commit_once("SendMessage", "task projection is not authorized")
+        .await;
+
+    sender
+        .send(json!({
+            "id":"post-commit-unary-error",
+            "method":"send_message",
+            "params":{"agent":"reviewer","text":"exactly once","wait":false,"timeout_ms":5_000}
+        }))
+        .await;
+
+    let delivery = recipient.recv().await;
+    let response = sender.recv().await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["task_id"], delivery["result"]["task_id"]);
+    assert_eq!(
+        response["result"]["agent"],
+        canonical_agent(&broker, "reviewer").await
+    );
+    assert_eq!(broker.send_message_count(), 1);
+    assert_eq!(broker.task_get_count(), 1);
+    assert_eq!(broker.delivery_count(), 1);
+    assert_eq!(runtime.task_count().await, 1);
+}
+
+#[tokio::test]
+async fn waited_send_subscribes_to_exact_task_after_post_commit_application_error() {
+    // Break caught: the streaming response fails after durable creation, and the caller receives
+    // an error instead of following the already-running exact task to its terminal reply.
+    let runtime = TestBrokerRuntime::new();
+    let broker = runtime.start_broker().await;
+    broker.add_agent("implementer", "w1:p1").await;
+    broker.add_agent("reviewer", "w1:p2").await;
+    let mut sender = ClientSessionProcess::spawn(&broker, "w1:p1", "pi-session-1").await;
+    let mut recipient = ClientSessionProcess::spawn(&broker, "w1:p2", "pi-session-2").await;
+    await_client_pair_ready(&mut sender, &mut recipient).await;
+    recipient
+        .send(json!({"id":"delivery","method":"wait_for_message","params":{"timeout_ms":5_000}}))
+        .await;
+    broker
+        .fail_jsonrpc_response_after_commit_once(
+            "SendStreamingMessage",
+            "task projection is not authorized",
+        )
+        .await;
+
+    sender
+        .send(json!({
+            "id":"post-commit-stream-error",
+            "method":"send_message",
+            "params":{"agent":"reviewer","text":"wait exactly once","timeout_ms":5_000}
+        }))
+        .await;
+    let delivery = recipient.recv().await;
+    let task_id = delivery["result"]["task_id"].as_str().unwrap().to_owned();
+    recipient
+        .send(json!({
+            "id":"reply",
+            "method":"reply",
+            "params":{"task_id":task_id,"text":"finished once"}
+        }))
+        .await;
+    assert_eq!(recipient.recv().await["id"], "reply");
+
+    let response = sender.recv().await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["task_id"], task_id);
+    assert_eq!(response["result"]["state"], "completed");
+    assert_eq!(response["result"]["text"], "finished once");
+    assert_eq!(broker.streaming_send_count(), 1);
+    assert_eq!(broker.task_get_count(), 1);
+    assert_eq!(broker.task_subscription_count(), 1);
+    assert_eq!(broker.delivery_count(), 1);
+    assert_eq!(runtime.task_count().await, 1);
+}
+
+#[tokio::test]
 async fn application_internal_errors_with_transport_prefixes_are_final() {
     // Break caught: broker-controlled INTERNAL_ERROR text is mistaken for trusted transport
     // provenance and starts replacement recovery instead of returning the application error.
@@ -4203,7 +4294,11 @@ async fn application_internal_errors_with_transport_prefixes_are_final() {
         assert_eq!(response["error"]["message"], message, "{response}");
     }
     assert_eq!(broker.send_message_count(), FORGED_TRANSPORT_PREFIXES.len());
-    assert_eq!(broker.task_get_count(), 0);
+    assert_eq!(
+        broker.task_get_count(),
+        FORGED_TRANSPORT_PREFIXES.len(),
+        "each ambiguous send error gets one exact-ID inspection"
+    );
     assert_eq!(broker.task_subscription_count(), 0);
     assert_eq!(broker.task_list_count(), 0);
     assert_eq!(runtime.task_count().await, 0);
@@ -4260,7 +4355,11 @@ async fn streaming_send_application_errors_with_transport_prefixes_are_final() {
         FORGED_TRANSPORT_PREFIXES.len()
     );
     assert_eq!(broker.send_message_count(), 0);
-    assert_eq!(broker.task_get_count(), 0);
+    assert_eq!(
+        broker.task_get_count(),
+        FORGED_TRANSPORT_PREFIXES.len(),
+        "each ambiguous streaming-send error gets one exact-ID inspection"
+    );
     assert_eq!(broker.task_subscription_count(), 0);
     assert_eq!(broker.task_list_count(), 0);
     assert_eq!(broker.delivery_count(), 0);

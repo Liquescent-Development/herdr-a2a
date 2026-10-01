@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fmt, fs,
     fs::{File, OpenOptions},
@@ -19,6 +20,7 @@ use herdr_a2a_core::{AgentName, MAX_RETAINED_TASKS, RegistrationId, TERMINAL_RET
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use rustix::fs::{Mode, OFlags, open, openat};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::IdentityStore;
 
@@ -28,6 +30,10 @@ const MAX_PAGE_SIZE: i32 = 100;
 const PAGE_CURSOR_VERSION: u8 = 3;
 const MAX_PAGE_TOKEN_BYTES: usize = 2 * 1024;
 const MAX_READ_ONLY_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_SDK_PROJECTION_ADMISSIONS_PER_TASK: usize = 8;
+
+type ProjectionFingerprint = [u8; 32];
+type SdkProjectionAdmissions = Arc<Mutex<HashMap<String, HashMap<ProjectionFingerprint, u64>>>>;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -67,6 +73,7 @@ impl From<rusqlite::Error> for StoreError {
 pub struct SqliteTaskStore {
     pub(crate) connection: Arc<Mutex<Connection>>,
     identity_store: IdentityStore,
+    sdk_projection_admissions: SdkProjectionAdmissions,
     #[cfg(test)]
     allow_uncoordinated_sdk_writes: bool,
 }
@@ -135,6 +142,7 @@ impl SqliteTaskStore {
         Ok(Self {
             connection,
             identity_store,
+            sdk_projection_admissions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             allow_uncoordinated_sdk_writes: false,
         })
@@ -142,6 +150,16 @@ impl SqliteTaskStore {
 
     pub fn identity_store(&self) -> IdentityStore {
         self.identity_store.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_sdk_projection_admissions(&self) -> usize {
+        self.sdk_projection_admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(HashMap::len)
+            .sum()
     }
 
     #[cfg(test)]
@@ -205,18 +223,121 @@ impl SqliteTaskStore {
         .map_err(|_| A2AError::internal("task store worker failed"))?
     }
 
+    pub(crate) async fn authorize_sdk_projection(&self, task: &Task) -> Result<(), A2AError> {
+        let columns = TaskColumns::from_task(task)?;
+        let task_id = columns.task_id.clone();
+        let expected_json = columns.task_json.clone();
+        let (version, stored_json) = self
+            .run_blocking(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT version, task_json FROM tasks WHERE task_id = ?1",
+                        [&task_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|_| database_error())?
+                    .ok_or_else(|| A2AError::task_not_found(&task_id))
+            })
+            .await?;
+        if stored_json != expected_json {
+            return Err(A2AError::internal(
+                "executor task projection is not authoritative",
+            ));
+        }
+        let version = u64::try_from(version)
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or_else(|| A2AError::internal("stored task version is invalid"))?;
+        let fingerprint: ProjectionFingerprint = Sha256::digest(columns.task_json).into();
+        let mut admissions = self
+            .sdk_projection_admissions
+            .lock()
+            .map_err(|_| A2AError::internal("task projection admissions are unavailable"))?;
+        let projections = admissions.entry(columns.task_id).or_default();
+        if !projections.contains_key(&fingerprint)
+            && projections.len() == MAX_SDK_PROJECTION_ADMISSIONS_PER_TASK
+        {
+            let oldest = projections
+                .iter()
+                .min_by_key(|(_, version)| **version)
+                .map(|(fingerprint, _)| *fingerprint)
+                .expect("a full projection-admission set is nonempty");
+            projections.remove(&oldest);
+        }
+        projections.insert(fingerprint, version);
+        Ok(())
+    }
+
     async fn apply_sdk_projection(&self, task: Task) -> Result<u64, A2AError> {
         let columns = TaskColumns::from_task(&task)?;
-        self.run_blocking(move |connection| {
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|_| database_error())?;
-            let version = crate::ledger::apply_authorized_projection(&transaction, &columns)
-                .map_err(projection_error)?;
-            transaction.commit().map_err(|_| database_error())?;
-            Ok(version)
-        })
-        .await
+        let task_id = columns.task_id.clone();
+        let task_fingerprint: ProjectionFingerprint = Sha256::digest(&columns.task_json).into();
+        let admissions = Arc::clone(&self.sdk_projection_admissions);
+        let (version, superseded_from) = self
+            .run_blocking(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|_| database_error())?;
+                let application =
+                    crate::ledger::apply_authorized_projection(&transaction, &columns);
+                let (version, superseded_from) = match application {
+                    Ok(version) => (version, None),
+                    Err(error)
+                        if matches!(
+                            &error,
+                            StoreError::InvalidData(message)
+                                if message == crate::ledger::PROJECTION_NOT_AUTHORIZED
+                        ) =>
+                    {
+                        let admitted_version = admissions
+                            .lock()
+                            .map_err(|_| {
+                                A2AError::internal("task projection admissions are unavailable")
+                            })?
+                            .get(&columns.task_id)
+                            .and_then(|projections| projections.get(&task_fingerprint))
+                            .copied();
+                        let Some(admitted_version) = admitted_version else {
+                            return Err(projection_error(error));
+                        };
+                        let current_version = transaction
+                            .query_row(
+                                "SELECT version FROM tasks WHERE task_id = ?1",
+                                [&columns.task_id],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .optional()
+                            .map_err(|_| database_error())?
+                            .and_then(|version| u64::try_from(version).ok())
+                            .filter(|version| *version > admitted_version)
+                            .ok_or_else(|| projection_error(error))?;
+                        (current_version, Some(admitted_version))
+                    }
+                    Err(error) => return Err(projection_error(error)),
+                };
+                transaction.commit().map_err(|_| database_error())?;
+                Ok((version, superseded_from))
+            })
+            .await?;
+        let mut admissions = self
+            .sdk_projection_admissions
+            .lock()
+            .map_err(|_| A2AError::internal("task projection admissions are unavailable"))?;
+        let remove_task_entry = admissions.get_mut(&task_id).is_some_and(|projections| {
+            projections.remove(&task_fingerprint);
+            projections.is_empty()
+        });
+        if remove_task_entry {
+            admissions.remove(&task_id);
+        }
+        drop(admissions);
+        if let Some(admitted_version) = superseded_from {
+            eprintln!(
+                "herdr-a2a: projection_superseded task_id={task_id} admitted_version={admitted_version} authoritative_version={version}"
+            );
+        }
+        Ok(version)
     }
 
     pub async fn claim_task_owner(
@@ -1357,6 +1478,24 @@ mod tests {
 
     fn recipient(name: &str) -> AgentName {
         AgentName::parse(name).unwrap()
+    }
+
+    #[tokio::test]
+    async fn abandoned_sdk_projection_admissions_are_bounded_per_task() {
+        // Break caught: canceled SDK consumers leave one exact projection admission per lease
+        // transition, allowing a retained task to grow process memory without a bound.
+        let store = test_store();
+        let mut projection = task_at("bounded-admissions", TaskState::Submitted, 1_000);
+        store.create(projection.clone()).await.unwrap();
+        for timestamp in 1_000..1_009 {
+            projection.status.timestamp = Some(Utc.timestamp_millis_opt(timestamp).unwrap());
+            if timestamp > 1_000 {
+                store.update(projection.clone()).await.unwrap();
+            }
+            store.authorize_sdk_projection(&projection).await.unwrap();
+        }
+
+        assert_eq!(store.pending_sdk_projection_admissions(), 8);
     }
 
     async fn stored_task_count(store: &SqliteTaskStore) -> i64 {

@@ -178,6 +178,7 @@ impl AgentExecutor for HerdrAgentExecutor {
                 .get(&context.task_id)
                 .await?
                 .ok_or_else(|| A2AError::task_not_found(&context.task_id))?;
+            store.authorize_sdk_projection(&task).await?;
             Ok(StreamResponse::Task(task))
         }))
     }
@@ -220,6 +221,7 @@ async fn begin_execution(
         .get(&task_id)
         .await?
         .ok_or_else(|| A2AError::task_not_found(&task_id))?;
+    store.authorize_sdk_projection(&projection).await?;
     if matches!(
         durable.state,
         herdr_a2a_core::DurableTaskState::Replied
@@ -251,6 +253,7 @@ async fn begin_execution(
             .get(&task_id)
             .await?
             .ok_or_else(|| A2AError::task_not_found(&task_id))?;
+        store.authorize_sdk_projection(&task).await?;
         Ok(StreamResponse::Task(task))
     };
 
@@ -1270,19 +1273,23 @@ mod workflow_tests {
             service_params: params,
             tenant: send.tenant.clone(),
         };
-        let first =
-            HerdrAgentExecutor::with_admissions(broker.clone(), store, handler.admissions.clone())
-                .execute(context)
-                .next()
-                .await
-                .unwrap()
-                .unwrap();
+        let first = HerdrAgentExecutor::with_admissions(
+            broker.clone(),
+            store.clone(),
+            handler.admissions.clone(),
+        )
+        .execute(context)
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
         drop(admission_lease);
         let StreamResponse::Task(task) = first else {
             panic!("executor did not return the durable task projection")
         };
         assert_eq!(task.id, admitted.task_id);
         assert_eq!(task.status.state, TaskState::Submitted);
+        assert_eq!(store.pending_sdk_projection_admissions(), 1);
 
         let resumed = broker
             .start_or_resume(
