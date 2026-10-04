@@ -117,6 +117,7 @@ struct TestMiddleware {
     registration_lost_responses: Arc<tokio::sync::Mutex<HashSet<String>>>,
     captured_requests: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Value>>>>,
     application_errors: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    post_commit_application_errors: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 struct EndpointStallState {
@@ -301,6 +302,27 @@ async fn record_metrics(
     let response = next
         .run(Request::from_parts(parts, Body::from(bytes)))
         .await;
+    if let Some(message) = match method.as_deref() {
+        Some(method) => state
+            .post_commit_application_errors
+            .lock()
+            .await
+            .remove(method),
+        None => None,
+    } {
+        let id = request_value
+            .as_ref()
+            .and_then(|value| value.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let error = a2a::A2AError::internal(message).to_jsonrpc_error();
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": error,
+        }))
+        .into_response();
+    }
     let response_stall = match method.as_deref() {
         Some(method) => state
             .stalls
@@ -736,6 +758,14 @@ impl TestBroker {
     pub async fn fail_jsonrpc_method_once(&self, method: &str, message: &str) {
         self.middleware
             .application_errors
+            .lock()
+            .await
+            .insert(method.to_owned(), message.to_owned());
+    }
+
+    pub async fn fail_jsonrpc_response_after_commit_once(&self, method: &str, message: &str) {
+        self.middleware
+            .post_commit_application_errors
             .lock()
             .await
             .insert(method.to_owned(), message.to_owned());

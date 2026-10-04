@@ -1216,7 +1216,10 @@ async fn execute_new_task_operation(
                     )
                     .await
                 }
-                Ok(Err(error)) => Err(error.into()),
+                Ok(Err(error)) => {
+                    inspect_task_after_send_error(context, operation, connection, client, error)
+                        .await
+                }
                 Err(_) => Ok(operation_timeout_result(
                     operation,
                     false,
@@ -1246,7 +1249,12 @@ async fn execute_new_task_operation(
                     )
                     .await;
                 }
-                Ok(Err(error)) => return Err(error.into()),
+                Ok(Err(error)) => {
+                    return inspect_task_after_send_error(
+                        context, operation, connection, client, error,
+                    )
+                    .await;
+                }
                 Err(_) => {
                     return Ok(operation_timeout_result(
                         operation,
@@ -1268,6 +1276,7 @@ async fn execute_new_task_operation(
                     task_confirmed: false,
                     last_task: None,
                     resend_attempted: false,
+                    preconfirmation_error: None,
                 },
             )
             .await
@@ -1327,6 +1336,7 @@ struct TaskAttemptMemory {
     task_confirmed: bool,
     last_task: Option<Task>,
     resend_attempted: bool,
+    preconfirmation_error: Option<OperationClientError>,
 }
 
 async fn run_task_attempts(
@@ -1403,12 +1413,24 @@ async fn run_task_attempts(
                         validate_operation_task(operation, &task)?;
                         memory.task_confirmed = true;
                         memory.last_task = Some(task.clone());
-                        if task.status.state.is_terminal()
-                            || operation.wait_mode == TaskWaitMode::Immediate
-                        {
+                        memory.preconfirmation_error = None;
+                        if task.status.state.is_terminal() {
                             return Ok(task_result(&task));
                         }
+                        if operation.wait_mode == TaskWaitMode::Immediate {
+                            return immediate_result(operation, SendMessageResponse::Task(task));
+                        }
                         TaskAttemptState::Subscribe { connection, client }
+                    }
+                    Ok(Err(error))
+                        if a2a_task_is_definitely_missing(&error)
+                            && memory.preconfirmation_error.is_some() =>
+                    {
+                        return Err(memory
+                            .preconfirmation_error
+                            .take()
+                            .expect("checked preconfirmation error")
+                            .into());
                     }
                     Ok(Err(error))
                         if a2a_task_is_definitely_missing(&error)
@@ -1449,7 +1471,10 @@ async fn run_task_attempts(
                             Ok(Err(error)) if a2a_error_is_recoverable(&error) => {
                                 recovery_state(connection, &error)
                             }
-                            Ok(Err(error)) => return Err(error.into()),
+                            Ok(Err(error)) => {
+                                memory.preconfirmation_error = Some(error);
+                                TaskAttemptState::Inspect { connection, client }
+                            }
                             Err(_) => {
                                 return Ok(operation_timeout_result(
                                     operation,
@@ -1475,7 +1500,10 @@ async fn run_task_attempts(
                             Ok(Err(error)) if a2a_error_is_recoverable(&error) => {
                                 recovery_state(connection, &error)
                             }
-                            Ok(Err(error)) => return Err(error.into()),
+                            Ok(Err(error)) => {
+                                memory.preconfirmation_error = Some(error);
+                                TaskAttemptState::Inspect { connection, client }
+                            }
                             Err(_) => {
                                 return Ok(operation_timeout_result(
                                     operation,
@@ -1665,6 +1693,27 @@ async fn run_task_attempts(
     }
 }
 
+async fn inspect_task_after_send_error(
+    context: &SessionContext,
+    operation: &TaskOperation,
+    connection: Arc<BrokerConnection>,
+    client: SessionA2AClient,
+    error: OperationClientError,
+) -> Result<Value, DynError> {
+    run_task_attempts(
+        context,
+        operation,
+        TaskAttemptState::Inspect { connection, client },
+        TaskAttemptMemory {
+            task_confirmed: false,
+            last_task: None,
+            resend_attempted: true,
+            preconfirmation_error: Some(error),
+        },
+    )
+    .await
+}
+
 async fn recover_task_after_connection_loss(
     context: &SessionContext,
     operation: &TaskOperation,
@@ -1685,6 +1734,7 @@ async fn recover_task_after_connection_loss(
             task_confirmed,
             last_task,
             resend_attempted,
+            preconfirmation_error: None,
         },
     )
     .await
@@ -1871,6 +1921,7 @@ async fn resume_message(
             task_confirmed: true,
             last_task: Some(task),
             resend_attempted: false,
+            preconfirmation_error: None,
         },
     )
     .await
