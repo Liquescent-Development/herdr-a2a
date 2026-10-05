@@ -618,7 +618,8 @@ export async function startSessionClient(
   const spawn = options.spawn ?? ((file, args, spawnOptions) => nodeSpawn(file, args, spawnOptions));
   const child = spawn(
     canonicalExecutable,
-    ["client-session", "--harness-session-id", harnessSessionId],
+    // Base64url nonces may start '-'; bind the value so Clap cannot parse it as an option.
+    ["client-session", `--harness-session-id=${harnessSessionId}`],
     { env: childEnv, stdio: ["pipe", "pipe", "pipe"] },
   );
   const client = new SessionClient(child);
