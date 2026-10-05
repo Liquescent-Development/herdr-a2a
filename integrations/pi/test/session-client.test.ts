@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { chmod, mkdir, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
@@ -874,7 +874,7 @@ test("starts the descriptor executable with the Pi session ID after permission c
 
   assert.deepEqual(invocations, [[
     executablePath,
-    ["client-session", "--harness-session-id", "pi-session-123"],
+    ["client-session", "--harness-session-id=pi-session-123"],
     {
       env: {
         HERDR_SOCKET_PATH: socketPath,
@@ -884,6 +884,46 @@ test("starts the descriptor executable with the Pi session ID after permission c
       stdio: ["pipe", "pipe", "pipe"],
     },
   ]]);
+  await client.close();
+});
+
+test("leading-hyphen incarnation IDs are delivered as values, not CLI options", async () => {
+  // Break caught: a base64url process nonce starting '-' makes Clap reject startup,
+  // and every retry in that Pi process reuses the same failing nonce.
+  const fixture = await descriptorFixture();
+  const identity = "-v" + "A".repeat(41);
+  const child = new FakeSessionProcess();
+  const client = await startSessionClient(identity, {
+    env: { HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: fixture.workspaceId, TMPDIR: fixture.base },
+    platform: "darwin",
+    uid: process.getuid!(),
+    spawn: (_file, args) => {
+      assert.deepEqual(args, ["client-session", `--harness-session-id=${identity}`]);
+      queueMicrotask(() => child.respond({ id: "1", result: { agents: [] } }));
+      return child;
+    },
+  });
+  await client.close();
+});
+
+test("adapter-generated leading-hyphen arguments are accepted by the real native parser", {
+  skip: process.env.HERDR_A2A_TEST_CLI === undefined,
+}, async () => {
+  // This calls only native --help: no broker, registration, provider or configuration writes.
+  const fixture = await descriptorFixture();
+  const child = new FakeSessionProcess();
+  const client = await startSessionClient("-v" + "A".repeat(41), {
+    env: { HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: fixture.workspaceId, TMPDIR: fixture.base },
+    platform: "darwin",
+    uid: process.getuid!(),
+    spawn: (_file, args) => {
+      const result = spawnSync(process.env.HERDR_A2A_TEST_CLI!, [...args, "--help"], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /harness-session-id/);
+      queueMicrotask(() => child.respond({ id: "1", result: { agents: [] } }));
+      return child;
+    },
+  });
   await client.close();
 });
 
