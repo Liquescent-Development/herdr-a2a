@@ -376,23 +376,30 @@ async fn stop_follows_a_coordinator_owner_turnover() {
     let mut first = fixture.command(WORKSPACE_LEFT, "serve").spawn().unwrap();
     fixture.wait_for_descriptor(WORKSPACE_LEFT).await;
 
-    let mut stop = fixture.command(WORKSPACE_LEFT, "stop").spawn().unwrap();
+    let stop_marker = fixture.root.path().join("stop-owner-turnover-paused");
+    let stop_release = stop_marker.with_extension("release");
+    let mut stop_command = fixture.command(WORKSPACE_LEFT, "stop");
+    stop_command
+        .env(
+            "HERDR_A2A_TEST_STARTING_BOUNDARY",
+            "after-stop-request-before-lock-check",
+        )
+        .env("HERDR_A2A_TEST_STARTING_MARKER", &stop_marker);
+    let mut stop = stop_command.spawn().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !stop_marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("stop never paused after requesting shutdown from the first owner");
     tokio::time::timeout(Duration::from_secs(5), async {
         while read_descriptor(&fixture.paths(WORKSPACE_LEFT)).is_ok() {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
-    .expect("stop never requested shutdown from the first owner");
-    let stop_pid = stop.id().unwrap();
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-STOP", &stop_pid.to_string()])
-            .status()
-            .await
-            .unwrap()
-            .success()
-    );
+    .expect("first owner never removed its descriptor after the stop request");
     wait_for_exit(&mut first).await;
 
     let mut second = fixture.command(WORKSPACE_LEFT, "serve").spawn().unwrap();
@@ -416,14 +423,7 @@ async fn stop_follows_a_coordinator_owner_turnover() {
     })
     .await
     .expect("replacement coordinator never published its owner generation");
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-CONT", &stop_pid.to_string()])
-            .status()
-            .await
-            .unwrap()
-            .success()
-    );
+    fs::write(&stop_release, b"resume\n").unwrap();
     let stop_status = tokio::time::timeout(Duration::from_secs(6), stop.wait())
         .await
         .expect("stop lost the replacement coordinator generation")
