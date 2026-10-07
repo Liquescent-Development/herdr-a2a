@@ -4259,6 +4259,56 @@ async fn waited_send_subscribes_to_exact_task_after_post_commit_application_erro
 }
 
 #[tokio::test]
+async fn waited_send_inspects_exact_completed_task_after_confirmed_stream_error() {
+    // Break caught: a nonrecoverable application error after the stream confirmed the task is
+    // returned directly even though the exact durable task has already completed successfully.
+    let runtime = TestBrokerRuntime::new();
+    let broker = runtime.start_broker().await;
+    broker.add_agent("implementer", "w1:p1").await;
+    broker.add_agent("reviewer", "w1:p2").await;
+    let mut sender = ClientSessionProcess::spawn(&broker, "w1:p1", "pi-session-1").await;
+    let mut recipient = ClientSessionProcess::spawn(&broker, "w1:p2", "pi-session-2").await;
+    await_client_pair_ready(&mut sender, &mut recipient).await;
+    recipient
+        .send(json!({"id":"delivery","method":"wait_for_message","params":{"timeout_ms":5_000}}))
+        .await;
+    broker
+        .fail_jsonrpc_stream_after_confirmation_once(
+            "SendStreamingMessage",
+            "task store database operation failed",
+        )
+        .await;
+
+    sender
+        .send(json!({
+            "id":"confirmed-stream-application-error",
+            "method":"send_message",
+            "params":{"agent":"reviewer","text":"complete before error","timeout_ms":5_000}
+        }))
+        .await;
+    let delivery = recipient.recv().await;
+    let task_id = delivery["result"]["task_id"].as_str().unwrap().to_owned();
+    recipient
+        .send(json!({
+            "id":"reply",
+            "method":"reply",
+            "params":{"task_id":task_id,"text":"durable completion"}
+        }))
+        .await;
+    assert_eq!(recipient.recv().await["id"], "reply");
+
+    let response = sender.recv().await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["task_id"], task_id);
+    assert_eq!(response["result"]["state"], "completed");
+    assert_eq!(response["result"]["text"], "durable completion");
+    assert_eq!(broker.streaming_send_count(), 1);
+    assert_eq!(broker.task_get_count(), 1);
+    assert_eq!(broker.delivery_count(), 1);
+    assert_eq!(runtime.task_count().await, 1);
+}
+
+#[tokio::test]
 async fn application_internal_errors_with_transport_prefixes_are_final() {
     // Break caught: broker-controlled INTERNAL_ERROR text is mistaken for trusted transport
     // provenance and starts replacement recovery instead of returning the application error.

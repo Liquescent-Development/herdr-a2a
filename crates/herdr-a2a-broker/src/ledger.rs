@@ -154,44 +154,8 @@ impl SqliteTaskStore {
     }
 
     pub async fn apply_pending_projections(&self) -> Result<usize, StoreError> {
-        self.ledger_blocking(|connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let pending = {
-                let mut statement = transaction.prepare(
-                    "SELECT task_id, state_version, task_json
-                     FROM projection_outbox ORDER BY task_id",
-                )?;
-                statement
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            for (task_id, state_version, task_json) in &pending {
-                let task: Task = serde_json::from_str(task_json)
-                    .map_err(|_| invalid("projection outbox contains invalid task JSON"))?;
-                if task.id != *task_id {
-                    return Err(invalid("projection task ID does not match outbox key"));
-                }
-                let columns = TaskColumns::from_task(&task)
-                    .map_err(|_| invalid("projection task cannot be encoded"))?;
-                let applied_version = apply_authorized_projection(&transaction, &columns)?;
-                if applied_version
-                    != u64::try_from(*state_version)
-                        .map_err(|_| invalid("projection state version is invalid"))?
-                {
-                    return Err(invalid("intended task projection was not applied"));
-                }
-            }
-            transaction.commit()?;
-            Ok(pending.len())
-        })
-        .await
+        self.ledger_blocking(apply_pending_projections_on_connection)
+            .await
     }
 
     pub async fn task_principal(&self, task_id: &str) -> Result<Option<TaskPrincipal>, A2AError> {
@@ -405,7 +369,7 @@ impl BrokerPersistence for SqliteTaskStore {
             .map(|task| Ok((task.clone(), projection_json(task)?)))
             .collect::<Result<Vec<_>, StoreError>>()
             .map_err(|_| DomainError::PersistenceUnavailable)?;
-        let ledger_outcome = self
+        let (ledger_outcome, projection_outcome) = self
             .ledger_blocking(move |connection| {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -549,7 +513,7 @@ impl BrokerPersistence for SqliteTaskStore {
                     let stored = stored_task_row(&transaction, &task.task_id)?
                         .ok_or_else(|| invalid("version-suppressed task row is missing"))?;
                     if stored.legacy_quarantined != 0 || decode_durable_task(stored)? != task {
-                        return Ok(PersistenceCommitOutcome::ReconciliationRequired);
+                        return Ok((PersistenceCommitOutcome::ReconciliationRequired, None));
                     }
                 } else {
                     transaction.execute(
@@ -567,15 +531,21 @@ impl BrokerPersistence for SqliteTaskStore {
             #[cfg(test)]
             admission_store.run_one_shot_ledger_commit_hook();
             admission_store.retire_sdk_projection_admissions(&batch.delete_task_ids);
-            Ok(PersistenceCommitOutcome::Complete)
+            let projection_outcome = apply_pending_projections_on_connection(connection)
+                .map(|_| PersistenceCommitOutcome::Complete)
+                .unwrap_or(PersistenceCommitOutcome::ReconciliationRequired);
+            Ok((PersistenceCommitOutcome::Complete, Some(projection_outcome)))
         })
             .await
             .map_err(|_| DomainError::PersistenceUnavailable)?;
-        let projection_outcome = self
-            .apply_pending_projections()
-            .await
-            .map(|_| PersistenceCommitOutcome::Complete)
-            .unwrap_or(PersistenceCommitOutcome::ReconciliationRequired);
+        let projection_outcome = match projection_outcome {
+            Some(outcome) => outcome,
+            None => self
+                .apply_pending_projections()
+                .await
+                .map(|_| PersistenceCommitOutcome::Complete)
+                .unwrap_or(PersistenceCommitOutcome::ReconciliationRequired),
+        };
         if ledger_outcome == PersistenceCommitOutcome::ReconciliationRequired
             || projection_outcome == PersistenceCommitOutcome::ReconciliationRequired
         {
@@ -584,6 +554,45 @@ impl BrokerPersistence for SqliteTaskStore {
             Ok(PersistenceCommitOutcome::Complete)
         }
     }
+}
+
+fn apply_pending_projections_on_connection(
+    connection: &mut Connection,
+) -> Result<usize, StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pending = {
+        let mut statement = transaction.prepare(
+            "SELECT task_id, state_version, task_json
+             FROM projection_outbox ORDER BY task_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (task_id, state_version, task_json) in &pending {
+        let task: Task = serde_json::from_str(task_json)
+            .map_err(|_| invalid("projection outbox contains invalid task JSON"))?;
+        if task.id != *task_id {
+            return Err(invalid("projection task ID does not match outbox key"));
+        }
+        let columns = TaskColumns::from_task(&task)
+            .map_err(|_| invalid("projection task cannot be encoded"))?;
+        let applied_version = apply_authorized_projection(&transaction, &columns)?;
+        if applied_version
+            != u64::try_from(*state_version)
+                .map_err(|_| invalid("projection state version is invalid"))?
+        {
+            return Err(invalid("intended task projection was not applied"));
+        }
+    }
+    transaction.commit()?;
+    Ok(pending.len())
 }
 
 fn quarantine_owner_only_rows(connection: &mut Connection) -> Result<usize, StoreError> {
@@ -1347,6 +1356,7 @@ mod tests {
     use std::sync::{
         Arc, Barrier as StdBarrier,
         atomic::{AtomicI64, Ordering},
+        mpsc,
     };
 
     use a2a::Task;
@@ -2404,6 +2414,79 @@ mod tests {
         assert_eq!(store.create(submitted).await.unwrap(), 3);
         assert_eq!(store.update(working).await.unwrap(), 3);
         assert_eq!(store.get("sdk-concurrent").await.unwrap(), Some(retained));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_stale_projection_cannot_enter_successful_reconciliation_gap() {
+        // Break caught: the durable ledger transaction releases the shared connection before
+        // successful outbox reconciliation, allowing an admitted older SDK projection to observe
+        // the transient outbox and fail an otherwise successful response stream.
+        let store = SqliteTaskStore::open(":memory:").unwrap();
+        store.prepare_startup(NOW).await.unwrap();
+        let queued = durable("sdk-reconciliation-gap", 1, DurableTaskState::Queued);
+        BrokerPersistence::commit(&store, batch(queued.clone()))
+            .await
+            .unwrap();
+        let emitted: a2a::Task = serde_json::from_str(&projection_json(&queued).unwrap()).unwrap();
+        store.authorize_sdk_projection(&emitted).await.unwrap();
+
+        let hook_entered = Arc::new(StdBarrier::new(2));
+        let hook_release = Arc::new(StdBarrier::new(2));
+        let entered_from_hook = hook_entered.clone();
+        let release_from_hook = hook_release.clone();
+        store.set_one_shot_ledger_commit_hook(Arc::new(move || {
+            entered_from_hook.wait();
+            release_from_hook.wait();
+        }));
+        let committing_store = store.clone();
+        let commit = tokio::spawn(async move {
+            BrokerPersistence::commit(
+                &committing_store,
+                batch(durable(
+                    "sdk-reconciliation-gap",
+                    2,
+                    DurableTaskState::Leased,
+                )),
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || hook_entered.wait())
+            .await
+            .unwrap();
+
+        let (contention_sender, contention_receiver) = mpsc::sync_channel(1);
+        store.set_one_shot_connection_contention_hook(Arc::new(move || {
+            contention_sender.send(()).unwrap();
+        }));
+        let applying_store = store.clone();
+        let apply = tokio::spawn(async move { applying_store.create(emitted).await });
+        let contention_observed = tokio::task::spawn_blocking(move || {
+            contention_receiver.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap();
+        if contention_observed.is_err() {
+            let release_after_missing_contention = hook_release.clone();
+            tokio::task::spawn_blocking(move || release_after_missing_contention.wait())
+                .await
+                .unwrap();
+            panic!("stale projection worker did not contend for the held connection");
+        }
+        tokio::task::spawn_blocking(move || hook_release.wait())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            commit.await.unwrap().unwrap(),
+            PersistenceCommitOutcome::Complete
+        );
+        assert_eq!(apply.await.unwrap().unwrap(), 2);
+        assert_eq!(
+            store
+                .test_i64("SELECT COUNT(*) FROM projection_outbox")
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
