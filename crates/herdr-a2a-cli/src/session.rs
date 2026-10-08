@@ -1434,6 +1434,7 @@ async fn run_task_attempts(
                     }
                     Ok(Err(error))
                         if a2a_task_is_definitely_missing(&error)
+                            && !memory.task_confirmed
                             && operation.normalized_request.is_some()
                             && !memory.resend_attempted =>
                     {
@@ -1535,6 +1536,9 @@ async fn run_task_attempts(
                         }
                     }
                     Ok(Err(error)) if !a2a_error_is_recoverable(&error) => {
+                        if memory.task_confirmed {
+                            break TaskAttemptState::Inspect { connection, client };
+                        }
                         return Err(error.into());
                     }
                     Ok(Ok(None)) | Ok(Err(_)) => {

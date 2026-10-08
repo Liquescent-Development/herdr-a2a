@@ -118,6 +118,7 @@ struct TestMiddleware {
     captured_requests: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<Value>>>>,
     application_errors: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     post_commit_application_errors: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    stream_application_errors: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 struct EndpointStallState {
@@ -349,16 +350,52 @@ async fn record_metrics(
         });
         return Response::from_parts(parts, Body::from_stream(truncated));
     }
-    let truncate = match method {
-        Some(method) => state.truncated_streams.lock().await.remove(&method),
+    let truncate = match method.as_deref() {
+        Some(method) => state.truncated_streams.lock().await.remove(method),
         None => false,
     };
     if truncate {
         let (parts, body) = response.into_parts();
-        Response::from_parts(parts, Body::from_stream(body.into_data_stream().take(1)))
-    } else {
-        response
+        return Response::from_parts(parts, Body::from_stream(body.into_data_stream().take(1)));
     }
+    let stream_error = match method.as_deref() {
+        Some(method) => state.stream_application_errors.lock().await.remove(method),
+        None => None,
+    };
+    if let Some(message) = stream_error {
+        let id = request_value
+            .as_ref()
+            .and_then(|value| value.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let encoded = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": a2a::A2AError::internal(message).to_jsonrpc_error(),
+            })
+        );
+        let (parts, body) = response.into_parts();
+        let injected = futures::stream::unfold(
+            (body.into_data_stream(), false, Some(Bytes::from(encoded))),
+            |(mut stream, first_sent, mut error)| async move {
+                if !first_sent {
+                    return stream
+                        .next()
+                        .await
+                        .map(|item| (item, (stream, true, error)));
+                }
+                if let Some(error) = error.take() {
+                    while stream.next().await.is_some() {}
+                    return Some((Ok::<_, axum::Error>(error), (stream, true, None)));
+                }
+                None
+            },
+        );
+        return Response::from_parts(parts, Body::from_stream(injected));
+    }
+    response
 }
 
 struct TestBrokerRuntimeInner {
@@ -766,6 +803,14 @@ impl TestBroker {
     pub async fn fail_jsonrpc_response_after_commit_once(&self, method: &str, message: &str) {
         self.middleware
             .post_commit_application_errors
+            .lock()
+            .await
+            .insert(method.to_owned(), message.to_owned());
+    }
+
+    pub async fn fail_jsonrpc_stream_after_confirmation_once(&self, method: &str, message: &str) {
+        self.middleware
+            .stream_application_errors
             .lock()
             .await
             .insert(method.to_owned(), message.to_owned());

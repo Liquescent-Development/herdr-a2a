@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::TryLockError;
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
@@ -248,6 +250,8 @@ pub struct SqliteTaskStore {
     #[cfg(test)]
     ledger_commit_hook: Arc<Mutex<Option<LedgerCommitHook>>>,
     #[cfg(test)]
+    connection_contention_hook: Arc<Mutex<Option<LedgerCommitHook>>>,
+    #[cfg(test)]
     allow_uncoordinated_sdk_writes: bool,
 }
 
@@ -321,6 +325,8 @@ impl SqliteTaskStore {
             #[cfg(test)]
             ledger_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            connection_contention_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             allow_uncoordinated_sdk_writes: false,
         })
     }
@@ -355,6 +361,14 @@ impl SqliteTaskStore {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_one_shot_connection_contention_hook(&self, hook: LedgerCommitHook) {
+        *self
+            .connection_contention_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     #[cfg(test)]
@@ -408,7 +422,29 @@ impl SqliteTaskStore {
         F: FnOnce(&mut Connection) -> Result<T, A2AError> + Send + 'static,
     {
         let connection = Arc::clone(&self.connection);
+        #[cfg(test)]
+        let contention_hook = Arc::clone(&self.connection_contention_hook);
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let mut connection = match connection.try_lock() {
+                Ok(connection) => connection,
+                Err(TryLockError::WouldBlock) => {
+                    let hook = contention_hook
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    connection
+                        .lock()
+                        .map_err(|_| A2AError::internal("task store is unavailable"))?
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(A2AError::internal("task store is unavailable"));
+                }
+            };
+            #[cfg(not(test))]
             let mut connection = connection
                 .lock()
                 .map_err(|_| A2AError::internal("task store is unavailable"))?;
