@@ -5524,7 +5524,7 @@ fn managed_plugin_root_hardens_group_writable_herdr_namespace() {
     fs::create_dir_all(&plugin_root).unwrap();
     fs::write(
         plugin_root.join("herdr-plugin.toml"),
-        b"version = \"0.1.17\"\n",
+        b"version = \"0.1.18\"\n",
     )
     .unwrap();
     fs::set_permissions(
